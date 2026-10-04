@@ -21,7 +21,7 @@ Evidence of the wiring (outside this repo): pm2 app `gbrain` runs `src/cli.ts se
    (`serve-http.ts:1437`) → `src/core/oauth-provider.ts` verifies OAuth tokens, falling back to
    legacy `access_tokens` SHA-256 hashes (`oauth-provider.ts:645`). Legacy tokens are minted with
    `gbrain auth create <name>` (`src/commands/auth.ts:485`) or the admin API (journey `issue-api-key.md`).
-   Test: `test/e2e/serve-http-oauth.test.ts` :154 (token accepted), :190 (no header → 401) — Postgres-only.
+   Test: `test/e2e/serve-http-oauth.test.ts` :154 (OAuth token accepted), :782 (legacy-key path), :190 (no header → 401) — Postgres-only.
 3. The bot saves a fact → `put_page` writes a markdown page with frontmatter, chunks + embeds it
    (`src/core/operations.ts:725`). Because the call is remote, automatic link + timeline
    extraction is SKIPPED by design (`src/core/operations.ts:950`).

@@ -24,8 +24,9 @@ answer with citations back to pages.
 > ✅ CONFIRMED from the live system on 2026-10-04 (read-only probes + one `think` call).
 - `think` answers with **`ollama:qwen3:30b-a3b`** (local, $0) — reported as `modelUsed` by a live call. This
   only works because of the local Ollama chat patch (see `../local-ollama-provider/SPEC.md`).
-- 21 `think` calls since 2026-07-03: 12 succeeded, 9 failed (timeouts in July, GPU out-of-memory in September);
-  every call since 2026-09-30 succeeded, in 35–50 s.
+- The bot made 21 `think` calls 2026-07-03 → 10-04: 12 succeeded, 9 failed (timeouts in July; in September
+  llama-server ran out of GPU memory at startup). Every call since 2026-09-30 succeeded (incl. one onboarding
+  test call on 10-04), in about 33–51 s.
 
 ## Decision (2026-10-04)
 Keep `think` local; no paid fallback (a fallback would quietly send personal memory to a third party).

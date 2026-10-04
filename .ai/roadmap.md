@@ -2,7 +2,7 @@
 _Updated by autobuild (Absi's build skill) after each run. Newest at top of each section._
 
 > ⚠ RECONSTRUCTED from code on 2026-10-04 — needs confirmation. Sources: git history (fork cloned
-> 2026-06-29, 0 own commits, 1,457 behind upstream), the only fork PR (#1, this onboarding), the
+> 2026-06-29, 0 own commits, 1,784 behind upstream as of 2026-10-04 evening), the only fork PR (#1, this onboarding), the
 > uncommitted diff in the live checkout, file dates under `~/.gbrain` and `~/.gbrain-family`, and the
 > known issues in `bugs.md`. This roadmap tracks only fork-level work (running gbrain as Absi's
 > memory). Upstream gbrain's own backlog is `TODOS.md` — not duplicated here. There was no root
@@ -12,7 +12,7 @@ _Updated by autobuild (Absi's build skill) after each run. Newest at top of each
 - [ ] Bot adds graph links itself — absi-agent-bot PR #62 (in review, not deployed) — page-memory — [spec](features/page-memory/SPEC.md)
 
 ## Next (queued)
-- [ ] Catch up with upstream (v0.42.53 → v0.60.45, 1,457 commits) on a copy first, then swap — needs Absi's go (migrates live data) — upgrade-and-migrations — [spec](features/upgrade-and-migrations/SPEC.md)
+- [ ] Catch up with upstream (v0.42.53 → v0.60.48, 1,784 commits as of 2026-10-04 evening) on a copy first, then swap — needs Absi's go (migrates live data) — upgrade-and-migrations — [spec](features/upgrade-and-migrations/SPEC.md)
 - [ ] At the catch-up: drop the local Ollama patch, re-check `think` on qwen3, read the search mode — local-ollama-provider — [spec](features/local-ollama-provider/SPEC.md)
 - [ ] After the catch-up: build links from existing page text once, on a copy first — page-memory — [spec](features/page-memory/SPEC.md)
 

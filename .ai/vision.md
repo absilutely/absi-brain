@@ -21,7 +21,7 @@ Chat sessions forget. Before gbrain the bot kept memory in a plain markdown fold
 now a frozen backup per `prompts/memory.md:2`) with no search ranking, no embeddings, no synthesis.
 
 ## Who it's for
-- Absi, through his personal agent bot (absi-agent-bot) — the only user of the main brain on :3131 (it holds the brain's only key — confirmed 2026-10-04).
+- Absi, through his personal agent bot (absi-agent-bot) — the main brain's user on :3131 — it holds the brain's only API key (confirmed 2026-10-04), so every MCP write goes through it.
 - The bot's family tenant — its own brain on :3132, never mixed with Absi's.
 
 ## Non-goals

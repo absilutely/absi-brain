@@ -3,8 +3,8 @@
 > ⚠ RECONSTRUCTED from code on 2026-10-04 — needs confirmation
 
 `origin` = github.com/absilutely/absi-brain, `upstream` = github.com/garrytan/gbrain. As of
-2026-10-04 `origin/master` has **0 commits of its own** and is **1,457 commits behind** upstream
-(local checkout at v0.42.53.0; upstream is at v0.60.45.0).
+2026-10-04 `origin/master` has **0 commits of its own** and is **1,784 commits behind** upstream
+(local checkout at v0.42.53.0; upstream is at v0.60.48.0; the gap grows daily).
 
 1. `git fetch upstream` → see what's new (an "available updates" report was produced on
    2026-10-04 in the live checkout's gitignored `.temp/`).

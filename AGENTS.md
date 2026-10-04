@@ -3,7 +3,7 @@
 
 This checkout runs upstream gbrain (no committed fork changes) as the durable memory for Absi's agent bot
 (absi-agent-bot): pm2 `gbrain` serves the personal brain on 127.0.0.1:3131, pm2 `gbrain-family`
-serves the family brain on 127.0.0.1:3132 (`GBRAIN_HOME=C:/Users/absi/.gbrain-family`).
+serves the family brain on 127.0.0.1:3132 (`GBRAIN_HOME=~/.gbrain-family`).
 Everything after this block is upstream gbrain's own guide, unchanged — read it for architecture.
 
 **Memory (`.ai/`, all reconstructed 2026-10-04 — needs confirmation):**

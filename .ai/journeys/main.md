@@ -37,8 +37,8 @@ Evidence of the wiring (outside this repo): pm2 app `gbrain` runs `src/cli.ts se
    on a new session returns the page written in step 3.
    Test: none found for save-then-recall over MCP (gap) — the independent verifier walks it live.
 
-UNCLEAR FROM CODE — confirm: is step 6 (cross-session recall) the payoff you'd judge this by,
-or is `think` (step 5) the one that matters most?
+Confirmed by usage (request log, 2026-10-04): 245 saves and 152 searches vs 21 `think` calls — save-then-recall
+(step 6) is the payoff; `think` is occasional.
 
 _Updated by autobuild (Absi's build skill) when a build changes the core experience. This journey
 is what its independent end-to-end verifier walks._

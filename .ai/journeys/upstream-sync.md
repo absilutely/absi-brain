@@ -22,5 +22,6 @@ the live checkout (`src/commands/upgrade.ts:26-34`, detection `:662`) — bypass
 Config today: `self_upgrade.mode = notify` (`~/.gbrain/config.json`; default set at
 `src/commands/upgrade.ts:296-299`) — gbrain only notifies, it never self-upgrades.
 
-UNCLEAR FROM CODE — confirm: do you intend to stay a pure mirror (only ever take upstream), or
-carry your own patches (like the uncommitted Ollama chat change)?
+Decided 2026-10-04: stay a pure mirror. Safeguards for the catch-up (needs Absi's go — it migrates live data):
+stop both servers → cold-copy `~/.gbrain` and `~/.gbrain-family` → migrate the COPY → compare page counts,
+search and `think` → only then swap. Rollback = the old checkout + the old database folders.

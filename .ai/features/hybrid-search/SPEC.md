@@ -22,6 +22,7 @@ search modes that trade cost for quality. (The `search` op's own description str
 - CLI dispatch: `test/cli-search-dispatch.test.ts`, `test/commands-search.test.ts`
 
 ## Open questions
-- UNCLEAR FROM CODE — confirm: which search mode is this brain on? Check with `gbrain search modes`
-  (needs the pm2 server stopped — PGLite is single-writer).
+- Search mode still unread (needs the server stopped). Most likely `conservative` — the unattended-install
+  default when no OpenAI key is set (`src/commands/init-mode-picker.ts:62-75`). Decided 2026-10-04: read it
+  during the upstream catch-up, when the server is stopped anyway.
 - Gap: no test found that guards vector recall quality on PGLite.

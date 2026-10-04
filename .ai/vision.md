@@ -21,15 +21,15 @@ Chat sessions forget. Before gbrain the bot kept memory in a plain markdown fold
 now a frozen backup per `prompts/memory.md:2`) with no search ranking, no embeddings, no synthesis.
 
 ## Who it's for
-- Absi, through his personal agent bot (absi-agent-bot) — the main brain's user on :3131 (UNCLEAR FROM CODE — confirm: is it the only writer? `/admin/api/api-keys` lists every key).
+- Absi, through his personal agent bot (absi-agent-bot) — the only user of the main brain on :3131 (it holds the brain's only key — confirmed 2026-10-04).
 - The bot's family tenant — its own brain on :3132, never mixed with Absi's.
 
 ## Non-goals
 - Not a product of its own: features come from upstream gbrain; this fork does not develop gbrain.
 - Not exposed to the network: both servers bind to loopback only (`src/commands/serve-http.ts:407`).
 - Not a shared brain: personal and family memory never merge (`GBRAIN_HOME` isolation).
-- UNCLEAR FROM CODE — confirm: none of upstream's ingestion daemons (meetings, email, the overnight
-  "dream" cycle) run here. Deliberate non-goal, or just not set up yet?
+- None of upstream's background work (meeting/email ingestion, the overnight maintenance cycle) runs here —
+  confirmed no job has ever run. Not a goal until the upstream catch-up is done.
 
 ## How success would show
 - A fact saved in one chat is recalled correctly in a later, unrelated chat (journey `journeys/main.md`).

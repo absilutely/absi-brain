@@ -19,4 +19,5 @@ The same dashboard (`admin/src/pages/`: Dashboard, Agents, Request log, Jobs, Ca
 `/admin` (`serve-http.ts:1380`). End-to-end coverage (Postgres-only): `test/e2e/serve-http-oauth.test.ts`
 (admin SPA served :244, admin stats need the cookie :335).
 
-UNCLEAR FROM CODE — confirm: do you ever open the dashboard yourself, or is it only used for minting keys?
+Confirmed 2026-10-04: the personal brain has exactly one key (`absi-agent-bot`, minted 2026-07-02), so its
+dashboard has only been used to mint that one. The family bot connects with a key named `family-agent`.

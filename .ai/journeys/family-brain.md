@@ -6,7 +6,7 @@ The same checkout serves a second brain with its own database, config and tokens
 bot's family tenant.
 
 Evidence: pm2 app `gbrain-family` runs `bun run src/cli.ts serve --http --port 3132
---suppress-bootstrap-token` with `GBRAIN_HOME=C:/Users/absi/.gbrain-family`;
+--suppress-bootstrap-token` with `GBRAIN_HOME=~/.gbrain-family`;
 absi-agent-bot `tenants/family.json` sets `brain.url = http://localhost:3132/mcp` with its own token.
 (The comment at absi-agent-bot `src/config.js:221` saying the family brain is `null`/skipped is stale.)
 
@@ -17,4 +17,5 @@ absi-agent-bot `tenants/family.json` sets `brain.url = http://localhost:3132/mcp
 4. The family tenant of the bot saves/recalls through :3132 exactly as in `main.md`.
 5. **Goal: nothing written to one brain is ever visible from the other.**
 
-UNCLEAR FROM CODE — confirm: who is the family tenant for (which family members, which chat)?
+Confirmed 2026-10-04: it backs the bot's family tenant — a shared household chat — and is barely used so far
+(1 page, 0 links; its key is named `family-agent`).

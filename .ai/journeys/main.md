@@ -16,21 +16,26 @@ Evidence of the wiring (outside this repo): pm2 app `gbrain` runs `src/cli.ts se
 ## The core user journey (the ultimate happy path)
 1. The brain server is up → `gbrain serve --http` listens on port 3131 by default
    (`src/commands/serve.ts:83`), bound to loopback `127.0.0.1` unless `--bind` is passed
-   (`src/commands/serve-http.ts:407`); `GET /health` answers without auth (`serve-http.ts:753`).
+   (`src/commands/serve-http.ts:407`); `GET /health` answers without auth (`serve-http.ts:753`). Test: `test/serve-http-health.test.ts`.
 2. The bot connects with its bearer token → `POST /mcp` is guarded by `requireBearerAuth`
    (`serve-http.ts:1437`) → `src/core/oauth-provider.ts` verifies OAuth tokens, falling back to
    legacy `access_tokens` SHA-256 hashes (`oauth-provider.ts:645`). Legacy tokens are minted with
-   `gbrain auth create <name>` (`src/commands/auth.ts:485`).
+   `gbrain auth create <name>` (`src/commands/auth.ts:485`) or the admin API (journey `issue-api-key.md`).
+   Test: `test/e2e/serve-http-oauth.test.ts` :154 (token accepted), :190 (no header → 401) — Postgres-only.
 3. The bot saves a fact → `put_page` writes a markdown page with frontmatter, chunks + embeds it
    (`src/core/operations.ts:725`). Because the call is remote, automatic link + timeline
    extraction is SKIPPED by design (`src/core/operations.ts:950`).
+   Tests: `test/put-page-provenance.test.ts`, `test/put-page-namespace.test.ts`.
 4. The bot recalls → `search` (cheap hybrid: keyword + vector, no query expansion — keyword-only
    only if the `search.mcp_keyword_only` setting is on, `operations.ts:1414`) or `query` (full
    hybrid with expansion) returns ranked pages (`operations.ts:1391`, `:1450`; `src/core/search/hybrid.ts`).
+   Tests: `test/e2e/serve-http-oauth.test.ts:167` (search over MCP, Postgres-only), `test/hybrid-search-lite.serial.test.ts`.
 5. The bot asks an open question → `think` gathers evidence and returns a synthesized, cited
    answer from the chat model (`src/core/operations.ts:1792`, `src/core/think/`).
+   Test: `test/think-pipeline.serial.test.ts`.
 6. **Goal achieved: a later chat recalls what an earlier chat stored** → `get_page` / `search`
    on a new session returns the page written in step 3.
+   Test: none found for save-then-recall over MCP (gap) — the independent verifier walks it live.
 
 UNCLEAR FROM CODE — confirm: is step 6 (cross-session recall) the payoff you'd judge this by,
 or is `think` (step 5) the one that matters most?

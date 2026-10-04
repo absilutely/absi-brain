@@ -25,10 +25,13 @@ probe and an admin surface.
 - IF the admin bootstrap token is weak THEN the server refuses to start (`serve-http.ts:84-86`, `:500-503`;
   `test/serve-http-bootstrap-token.test.ts`). `--suppress-bootstrap-token` keeps its value out of logs
   (`:497-508`) — untested (gap).
-- Token rules (valid → tools list, revoked → 401, malformed params → `invalid_params`, one
-  `mcp_request_log` row per request) are tested in `test/e2e/http-transport.test.ts` — but against the
-  LEGACY transport on Postgres, not the `serve-http` path pm2 runs.
+- The live server end to end (`test/e2e/serve-http-oauth.test.ts`, spawns a real `serve --http` on port
+  19131, Postgres-only — skipped without `DATABASE_URL`): minted token accepted at `/mcp` (:154), invalid
+  token rejected (:181), missing `Authorization` → 401 (:190), read-only token refused for writes (:283),
+  OAuth and legacy token paths both resolve the agent name (:782), HTTP MCP cannot submit shell jobs (:847).
+- Older legacy-transport checks (revoked → 401, malformed params → `invalid_params`):
+  `test/e2e/http-transport.test.ts` — against `src/mcp/http-transport.ts`, not the live server.
 
 ## Open questions
-- Gap: no end-to-end test found for `serve-http`'s `/mcp` bearer-auth path. Worth adding if this fork
-  ever carries changes here.
+- Gap: every end-to-end auth test needs Postgres; nothing exercises `/mcp` auth on PGLite, the engine
+  this machine runs.

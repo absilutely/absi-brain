@@ -1,10 +1,29 @@
-<!-- absi-fork:start — Absi's fork overlay; keep this block short so upstream syncs merge cleanly -->
-> **Absi's fork (absilutely/absi-brain).** This checkout runs Absi's personal memory brain
-> (pm2 `gbrain` on :3131, `gbrain-family` on :3132) for absi-agent-bot. Before working here, read
-> [`.ai/`](./.ai/): [journeys](./.ai/journeys/) (main = agent memory over MCP),
-> [roadmap](./.ai/roadmap.md), [feature specs](./.ai/features/), [regressions to guard](./.ai/regressions.md),
-> [bug log](./.ai/bugs.md). Never commit to `master` — branch `absi-agent/<topic>` + PR.
-> Everything below this block is upstream gbrain's guide, unchanged.
+<!-- absi-fork:start — Absi's fork overlay; kept as one block so upstream syncs merge cleanly -->
+# absi-brain — Absi's fork of gbrain (canonical index)
+
+This checkout runs upstream gbrain (no committed fork changes) as the durable memory for Absi's agent bot
+(absi-agent-bot): pm2 `gbrain` serves the personal brain on 127.0.0.1:3131, pm2 `gbrain-family`
+serves the family brain on 127.0.0.1:3132 (`GBRAIN_HOME=C:/Users/absi/.gbrain-family`).
+Everything after this block is upstream gbrain's own guide, unchanged — read it for architecture.
+
+**Memory (`.ai/`, all reconstructed 2026-10-04 — needs confirmation):**
+[vision](./.ai/vision.md) · [journeys](./.ai/journeys/) (main = the bot saves + recalls over MCP) ·
+[roadmap](./.ai/roadmap.md) · [feature specs](./.ai/features/) · [design](./.ai/design/DESIGN.md) ·
+[bug log](./.ai/bugs.md) · [regressions to guard](./.ai/regressions.md).
+Upstream's backlog stays in `TODOS.md`.
+
+**Where things are:** `src/cli.ts` (CLI entry) · `src/commands/` (one file per command; `serve-http.ts` =
+the live server) · `src/core/operations.ts` (every MCP tool) · `src/core/` (engines, search, think, AI
+gateway, config) · `admin/` (dashboard UI) · `skills/` (agent skills) · `test/` (unit), `test/e2e/` · `docs/`.
+
+**Run / test (from the repo root; no global `gbrain` install — use `bun run src/cli.ts <cmd>`):**
+- Unit tests: `bun run test` · typecheck: `bun run typecheck` · fast gates: `bun run verify`
+- One file: `bun test test/<file>.test.ts` · end-to-end tests need Postgres (`DATABASE_URL`), else they skip
+- Edited AGENTS.md or CLAUDE.md? Run `bun run build:llms` (guarded by `test/build-llms.test.ts`)
+- Live servers: `pm2 restart gbrain gbrain-family`; health: `curl http://127.0.0.1:3131/health`
+- PGLite is single-writer: CLI commands against a live brain time out — go through MCP or stop the server
+- Never `gbrain upgrade` here (it git-pulls this checkout); never commit to `master` — branch
+  `absi-agent/<topic>` + PR.
 <!-- absi-fork:end -->
 
 # Agents working on GBrain

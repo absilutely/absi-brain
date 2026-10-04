@@ -9,7 +9,7 @@ Behaviors the bot depends on. Any change (including an upstream sync) must keep 
 | Server starts with a weak admin token | `test/serve-http-bootstrap-token.test.ts` |
 | Admin token leaks into logs (`--suppress-bootstrap-token`) | unguarded (gap) |
 | Health probe changes shape | `test/serve-http-health.test.ts` |
-| Token auth rules (revoked → 401 etc.) | `test/e2e/http-transport.test.ts` — legacy transport, Postgres-only (needs `DATABASE_URL`); does NOT cover the `serve-http` path pm2 runs (gap) |
+| Bot can't log in / tokens bypassed on the live server | `test/e2e/serve-http-oauth.test.ts` (real `serve --http`, Postgres-only — needs `DATABASE_URL`; no PGLite equivalent) |
 | Personal and family brains bleed into each other | `test/gbrain-home-isolation.test.ts` |
 | Saved pages lose provenance / namespace | `test/put-page-provenance.test.ts`, `test/put-page-namespace.test.ts` |
 | Keyword search path changes | `test/hybrid-search-lite.serial.test.ts` (keyword-only; vector recall is unguarded on PGLite) |

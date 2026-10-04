@@ -1,3 +1,6 @@
-# transient build artifacts from autobuild (Absi's build skill) — never committed
-tmp/
-features/*/verification/
+/tmp/
+/logs/
+/plan.json*
+/PLAN.md
+/features/*/verification/
+/features/*/run.log

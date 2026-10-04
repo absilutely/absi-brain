@@ -35,4 +35,4 @@ now a frozen backup per `prompts/memory.md:2`) with no search ranking, no embedd
 - A fact saved in one chat is recalled correctly in a later, unrelated chat (journey `journeys/main.md`).
 - Both servers stay up (`/health` 200 on :3131 and :3132) and the bot never hits "not connected".
 - Upstream updates can be pulled in without breaking the bot (journey `journeys/upstream-sync.md`).
-- Cost stays near zero: embeddings are local Ollama; only answer-writing uses a paid model.
+- Cost stays near zero: embeddings and `think` both run on local Ollama models.

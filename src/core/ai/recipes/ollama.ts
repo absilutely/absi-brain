@@ -21,6 +21,21 @@ export const ollama: Recipe = {
       // OLLAMA_NUM_PARALLEL config; no static cap to declare. v0.32 (#779).
       no_batch_cap: true,
     },
+    // Local chat/synthesis via Ollama's OpenAI-compatible /v1/chat/completions.
+    // models: [] => accept any locally-pulled chat model id (e.g. qwen3:30b-a3b);
+    // assertTouchpoint only enforces an allow-list when it is non-empty. Kept OUT
+    // of the subagent loop (supports_subagent_loop: false) so the Anthropic-only
+    // tool-loop tier never routes here. Free + local.
+    chat: {
+      models: [],
+      supports_tools: false,
+      supports_subagent_loop: false,
+      supports_prompt_cache: false,
+      max_context_tokens: 32768,
+      cost_per_1m_input_usd: 0,
+      cost_per_1m_output_usd: 0,
+      price_last_verified: '2026-07-04',
+    },
   },
-  setup_hint: 'Install Ollama from https://ollama.ai, then `ollama pull nomic-embed-text` and `ollama serve`.',
+  setup_hint: 'Install Ollama from https://ollama.ai, then `ollama pull nomic-embed-text` and `ollama serve`. For local synthesis, also `ollama pull <chat-model>` and set chat_model / models.default to `ollama:<chat-model>`.',
 };

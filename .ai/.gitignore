@@ -1,0 +1,3 @@
+# autobuild transient artifacts — never committed
+tmp/
+features/*/verification/

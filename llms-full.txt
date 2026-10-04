@@ -11,6 +11,15 @@ For the link-only index, see `llms.txt`. Source of truth: https://github.com/gar
 
 Source: https://raw.githubusercontent.com/garrytan/gbrain/master/AGENTS.md
 
+<!-- absi-fork:start — Absi's fork overlay; keep this block short so upstream syncs merge cleanly -->
+> **Absi's fork (absilutely/absi-brain).** This checkout runs Absi's personal memory brain
+> (pm2 `gbrain` on :3131, `gbrain-family` on :3132) for absi-agent-bot. Before working here, read
+> [`.ai/`](./.ai/): [journeys](./.ai/journeys/) (main = agent memory over MCP),
+> [roadmap](./.ai/roadmap.md), [feature specs](./.ai/features/), [regressions to guard](./.ai/regressions.md),
+> [bug log](./.ai/bugs.md). Never commit to `master` — branch `absi-agent/<topic>` + PR.
+> Everything below this block is upstream gbrain's guide, unchanged.
+<!-- absi-fork:end -->
+
 # Agents working on GBrain
 
 This is your install + operating protocol. Claude Code reads `./CLAUDE.md` automatically.
@@ -146,6 +155,10 @@ publishing: `LLMS_REPO_BASE=https://raw.githubusercontent.com/your-org/your-fork
 ## CLAUDE.md
 
 Source: https://raw.githubusercontent.com/garrytan/gbrain/master/CLAUDE.md
+
+<!-- absi-fork:start -->
+> **Absi's fork:** read the fork block at the top of [`AGENTS.md`](./AGENTS.md) and [`.ai/`](./.ai/) first. The rest of this file is upstream gbrain's, unchanged.
+<!-- absi-fork:end -->
 
 # CLAUDE.md
 

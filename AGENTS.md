@@ -1,3 +1,12 @@
+<!-- absi-fork:start — Absi's fork overlay; keep this block short so upstream syncs merge cleanly -->
+> **Absi's fork (absilutely/absi-brain).** This checkout runs Absi's personal memory brain
+> (pm2 `gbrain` on :3131, `gbrain-family` on :3132) for absi-agent-bot. Before working here, read
+> [`.ai/`](./.ai/): [journeys](./.ai/journeys/) (main = agent memory over MCP),
+> [roadmap](./.ai/roadmap.md), [feature specs](./.ai/features/), [regressions to guard](./.ai/regressions.md),
+> [bug log](./.ai/bugs.md). Never commit to `master` — branch `absi-agent/<topic>` + PR.
+> Everything below this block is upstream gbrain's guide, unchanged.
+<!-- absi-fork:end -->
+
 # Agents working on GBrain
 
 This is your install + operating protocol. Claude Code reads `./CLAUDE.md` automatically.

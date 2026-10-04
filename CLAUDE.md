@@ -1,3 +1,7 @@
+<!-- absi-fork:start -->
+> **Absi's fork:** read the fork block at the top of [`AGENTS.md`](./AGENTS.md) and [`.ai/`](./.ai/) first. The rest of this file is upstream gbrain's, unchanged.
+<!-- absi-fork:end -->
+
 # CLAUDE.md
 
 GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable

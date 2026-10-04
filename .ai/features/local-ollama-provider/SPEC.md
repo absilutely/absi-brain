@@ -15,7 +15,7 @@ Embeddings come from local Ollama (`ollama:nomic-embed-text`, 768 dims) — free
 The live checkout has an uncommitted edit to `src/core/ai/recipes/ollama.ts` adding a `chat`
 touchpoint (any local model, no tools, no subagent loop, $0). Upstream deliberately treats Ollama
 as embedding-only, and the patch **fails 2 upstream tests** in `test/ai/gateway-chat.test.ts`
-(lines 54 and 110). The live config's chat model is OpenRouter, so the patch is not exercised today.
+(lines 54 and 110). The live `chat_model` is OpenRouter, so the patch is most likely not exercised today.
 
 ## Acceptance-shaped behaviors
 - Recipe registry stays stable: `test/ai/recipes-existing-regression.test.ts`

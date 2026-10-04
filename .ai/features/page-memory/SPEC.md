@@ -15,10 +15,13 @@ and embeds it; the bot's memory is these pages.
 ## Acceptance-shaped behaviors
 - `put_page` chunks, embeds and reconciles tags (op description, :726)
 - IF the caller is remote (MCP) THEN auto-link + auto-timeline are skipped (`{ skipped: 'remote' }`),
-  to stop untrusted pages planting graph links (:928-952). Local CLI writes do run them.
+  to stop untrusted pages planting graph links (:928-952). Exceptions: trusted local CLI writes, and
+  remote subagent writes restricted to an allowed slug list (:947-949) — and in both cases only when
+  `auto_link` / `auto_timeline` are enabled (`isAutoLinkEnabled`).
 - Provenance + namespace rules: `test/put-page-provenance.test.ts`, `test/put-page-namespace.test.ts`
 - Link extraction: `test/link-extraction.test.ts`; listing regression: `test/e2e/list-pages-regression.test.ts`
 
 ## Open questions
-- UNCLEAR FROM CODE — confirm: since MCP writes skip link extraction, is anything meant to build the
-  graph afterwards (e.g. a scheduled `gbrain extract` / autopilot)? No such schedule found on this machine.
+- UNCLEAR FROM CODE — confirm: since the bot's MCP writes skip link extraction, is anything meant to
+  build the graph afterwards (e.g. a scheduled `gbrain extract` / autopilot)? No such schedule found
+  on this machine (no pm2 app or scheduled task besides the two servers).

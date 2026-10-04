@@ -6,22 +6,28 @@
 
 ## What it does
 `gbrain serve --http` exposes every brain operation as an MCP tool at `/mcp`, guarded by bearer
-tokens, with an unauthenticated `/health` probe and an admin surface.
+tokens (OAuth 2.1 plus legacy `gbrain auth create` tokens), with an unauthenticated `/health`
+probe and an admin surface.
 
 ## Files
-- `src/commands/serve.ts` (default port 3131, line 83) → `src/commands/serve-http.ts`
-- `src/mcp/http-transport.ts` (bearer auth), `src/mcp/server.ts`, `src/mcp/dispatch.ts`, `src/mcp/tool-defs.ts`
-- `src/commands/auth.ts` (`gbrain auth create <name>`, line 485)
+- `src/commands/serve.ts` (default port 3131, :83; `--http` dispatches to serve-http, :74-76)
+- `src/commands/serve-http.ts` — the live server: loopback bind by default (:281), `/health` (:753),
+  `POST /mcp` behind `requireBearerAuth` (:1437)
+- `src/core/oauth-provider.ts` — token verification; legacy `access_tokens` fallback (:645)
+- `src/commands/auth.ts` (`gbrain auth create <name>`, :485)
 - Operation contract + trust boundary: `src/core/operations.ts` (`remote = true` for MCP callers)
+- Legacy, test-only: `src/mcp/http-transport.ts` (superseded per `serve.ts:74-76`)
 
-## Acceptance-shaped behaviors (from tests)
-- `/health` → 200 without a token (`test/e2e/http-transport.test.ts` test 1, `test/serve-http-health.test.ts`)
-- Valid bearer → `tools/list` returns the op list; `tools/call list_pages` round-trips (e2e tests 2–3)
-- IF the token is revoked THEN 401 (e2e test 4)
-- Every request logs a row in `mcp_request_log` (e2e test 7)
-- IF params are malformed THEN an `invalid_params` error result, not a crash (e2e test 8)
+## Acceptance-shaped behaviors
+- Server binds to `127.0.0.1` unless `--bind` is passed (`serve-http.ts:281`); neither pm2 app passes it,
+  so both brains are loopback-only.
+- `/health` answers without a token (`serve-http.ts:753`); probe logic: `test/serve-http-health.test.ts`
 - IF the admin bootstrap token is weak THEN the server refuses to start; `--suppress-bootstrap-token`
-  keeps its value out of logs (`src/commands/serve-http.ts:86`, `:492-506`; `test/serve-http-bootstrap-token.test.ts`)
+  keeps its value out of logs (`serve-http.ts:86`, `:492-506`; `test/serve-http-bootstrap-token.test.ts`)
+- Token rules (valid → tools list, revoked → 401, malformed params → `invalid_params`, one
+  `mcp_request_log` row per request) are tested in `test/e2e/http-transport.test.ts` — but against the
+  LEGACY transport on Postgres, not the `serve-http` path pm2 runs.
 
 ## Open questions
-- UNCLEAR FROM CODE — confirm: is :3131 reachable only on localhost, or also over Tailscale?
+- Gap: no end-to-end test found for `serve-http`'s `/mcp` bearer-auth path. Worth adding if this fork
+  ever carries changes here.

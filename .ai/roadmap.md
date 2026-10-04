@@ -1,5 +1,5 @@
 # Roadmap: absi-brain (Absi's fork of gbrain)
-_Updated by autobuild after each run. Newest at top of each section._
+_Updated by autobuild (Absi's build skill) after each run. Newest at top of each section._
 
 > ⚠ RECONSTRUCTED from code on 2026-10-04 — needs confirmation. This roadmap tracks only
 > fork-level work (running gbrain as Absi's memory). Upstream gbrain's own backlog is `TODOS.md`

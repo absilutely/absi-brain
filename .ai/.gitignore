@@ -1,3 +1,3 @@
-# autobuild transient artifacts — never committed
+# transient build artifacts from autobuild (Absi's build skill) — never committed
 tmp/
 features/*/verification/

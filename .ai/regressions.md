@@ -6,7 +6,8 @@ Behaviors the bot depends on. Any change (including an upstream sync) must keep 
 
 | What would break | Guard |
 |---|---|
-| Server leaks its admin token / starts with a weak one | `test/serve-http-bootstrap-token.test.ts` |
+| Server starts with a weak admin token | `test/serve-http-bootstrap-token.test.ts` |
+| Admin token leaks into logs (`--suppress-bootstrap-token`) | unguarded (gap) |
 | Health probe changes shape | `test/serve-http-health.test.ts` |
 | Token auth rules (revoked → 401 etc.) | `test/e2e/http-transport.test.ts` — legacy transport, Postgres-only (needs `DATABASE_URL`); does NOT cover the `serve-http` path pm2 runs (gap) |
 | Personal and family brains bleed into each other | `test/gbrain-home-isolation.test.ts` |

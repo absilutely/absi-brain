@@ -11,7 +11,7 @@ probe and an admin surface.
 
 ## Files
 - `src/commands/serve.ts` (default port 3131, :83; `--http` dispatches to serve-http, :74-76)
-- `src/commands/serve-http.ts` — the live server: loopback bind by default (:281), `/health` (:753),
+- `src/commands/serve-http.ts` — the live server: loopback bind by default (:407), `/health` (:753),
   `POST /mcp` behind `requireBearerAuth` (:1437)
 - `src/core/oauth-provider.ts` — token verification; legacy `access_tokens` fallback (:645)
 - `src/commands/auth.ts` (`gbrain auth create <name>`, :485)
@@ -19,11 +19,12 @@ probe and an admin surface.
 - Legacy, test-only: `src/mcp/http-transport.ts` (superseded per `serve.ts:74-76`)
 
 ## Acceptance-shaped behaviors
-- Server binds to `127.0.0.1` unless `--bind` is passed (`serve-http.ts:281`); neither pm2 app passes it,
+- Server binds to `127.0.0.1` unless `--bind` is passed (`serve-http.ts:407`); neither pm2 app passes it,
   so both brains are loopback-only.
 - `/health` answers without a token (`serve-http.ts:753`); probe logic: `test/serve-http-health.test.ts`
-- IF the admin bootstrap token is weak THEN the server refuses to start; `--suppress-bootstrap-token`
-  keeps its value out of logs (`serve-http.ts:86`, `:492-506`; `test/serve-http-bootstrap-token.test.ts`)
+- IF the admin bootstrap token is weak THEN the server refuses to start (`serve-http.ts:84-86`, `:500-503`;
+  `test/serve-http-bootstrap-token.test.ts`). `--suppress-bootstrap-token` keeps its value out of logs
+  (`:497-508`) — untested (gap).
 - Token rules (valid → tools list, revoked → 401, malformed params → `invalid_params`, one
   `mcp_request_log` row per request) are tested in `test/e2e/http-transport.test.ts` — but against the
   LEGACY transport on Postgres, not the `serve-http` path pm2 runs.

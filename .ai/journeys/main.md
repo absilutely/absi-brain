@@ -16,7 +16,7 @@ Evidence of the wiring (outside this repo): pm2 app `gbrain` runs `src/cli.ts se
 ## The core user journey (the ultimate happy path)
 1. The brain server is up → `gbrain serve --http` listens on port 3131 by default
    (`src/commands/serve.ts:83`), bound to loopback `127.0.0.1` unless `--bind` is passed
-   (`src/commands/serve-http.ts:281`); `GET /health` answers without auth (`serve-http.ts:753`).
+   (`src/commands/serve-http.ts:407`); `GET /health` answers without auth (`serve-http.ts:753`).
 2. The bot connects with its bearer token → `POST /mcp` is guarded by `requireBearerAuth`
    (`serve-http.ts:1437`) → `src/core/oauth-provider.ts` verifies OAuth tokens, falling back to
    legacy `access_tokens` SHA-256 hashes (`oauth-provider.ts:645`). Legacy tokens are minted with

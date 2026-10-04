@@ -16,8 +16,9 @@ and embeds it; the bot's memory is these pages.
 - `put_page` chunks, embeds and reconciles tags (op description, :726)
 - IF the caller is remote (MCP) THEN auto-link + auto-timeline are skipped (`{ skipped: 'remote' }`),
   to stop untrusted pages planting graph links (:928-952). Exceptions: trusted local CLI writes, and
-  remote subagent writes restricted to an allowed slug list (:947-949) — and in both cases only when
-  `auto_link` / `auto_timeline` are enabled (`isAutoLinkEnabled`).
+  remote subagent writes restricted to an allowed slug-prefix list (`ctx.allowedSlugPrefixes`, :947-949) —
+  and in both cases only when enabled: auto-link via `isAutoLinkEnabled` (:955), auto-timeline via
+  `isAutoTimelineEnabled` (:967).
 - Provenance + namespace rules: `test/put-page-provenance.test.ts`, `test/put-page-namespace.test.ts`
 - Link extraction: `test/link-extraction.test.ts`; listing regression: `test/e2e/list-pages-regression.test.ts`
 

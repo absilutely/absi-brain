@@ -11,3 +11,16 @@
   Timing: as soon as rehearsal passes. auto_chronicle: ON via the brain's local model (verify local in rehearsal;
   if it would route to a paid model, keep it OFF and report). Follow-ups for the roadmap: repo onboarding on the
   new code; Gmail open-loop ("who is waiting on me"); ChatGPT/Claude history connectors.
+- 2026-10-05 Target moved to upstream v0.60.64 (latest at rebase). Schema 119 -> 207 (88 migrations).
+- 2026-10-05 M1 PASS: backups taken with each server paused; copies opened by the old version: personal 131 pages, family 1; search OK.
+- 2026-10-05 M2: branch = upstream master + .ai/ only. Typecheck PASS on Bun 1.4.2. Full unit suite is Linux-targeted; a Windows run
+  showed 66+ failures in connector-recovery / symlink / isolated-install tests before it was cut by a host restart. Gate decision
+  (auto-resolved): the code gate is upstream CI on the exact commit (111 checks: 93 success, 18 skipped, 0 failed, incl. win32-x64 Bun 1.4.2);
+  this machine is proven by the M3 rehearsal journey instead.
+- 2026-10-05 M3 PASS: all migrations applied on copies; doctor 0 errors; counts equal (personal 131 pages/174 chunks/346 tags/24 timeline;
+  family 1/1/2/0); 5/5 known searches hit; save->find OK on both; brains isolated; think answered via ollama:qwen3:30b-a3b.
+  Required post-upgrade steps found: `repair safe-chunks --apply` (else remote search withholds old pages) + `projections drain`.
+- 2026-10-05 auto_chronicle: personal ON (reasoning tier = local model, $0). Family OFF: no local model configured there, its
+  reasoning tier resolves to a paid OpenAI model; owner's choice was "on, free" -> keep off and report.
+- 2026-10-05 Cutover approach: upgrade the system Bun in place (old exe kept beside it for rollback) rather than a pinned side copy —
+  one runtime, no bot-repo change. Watchdog task already disabled, so no restart race during the window.

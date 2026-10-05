@@ -7,3 +7,7 @@
 - 2026-10-05 Removed from scope: graph-links fix (already fixed on the bot side); optional connectors (own runs);
   repo onboarding (after the upgrade, on the new code).
 - 2026-10-05 Charter brief sent for approval. Waiting on: approval, cutover authorization + timing, auto_chronicle, follow-ups.
+- 2026-10-05 APPROVED by owner. Cutover: autonomous once every rehearsal check passes, auto-rollback on failure.
+  Timing: as soon as rehearsal passes. auto_chronicle: ON via the brain's local model (verify local in rehearsal;
+  if it would route to a paid model, keep it OFF and report). Follow-ups for the roadmap: repo onboarding on the
+  new code; Gmail open-loop ("who is waiting on me"); ChatGPT/Claude history connectors.

@@ -24,3 +24,13 @@
   reasoning tier resolves to a paid OpenAI model; owner's choice was "on, free" -> keep off and report.
 - 2026-10-05 Cutover approach: upgrade the system Bun in place (old exe kept beside it for rollback) rather than a pinned side copy —
   one runtime, no bot-repo change. Watchdog task already disabled, so no restart race during the window.
+- 2026-10-05 PR #2 merged (merge commit). M4 cutover PASS (run as a one-shot pm2 job so a host restart could not cut it):
+  fresh backup, code 0.60.64.0, system Bun 1.3.13 -> 1.4.2 in place (old exe kept as bun-1.3.13.exe), migrations +
+  safe-chunks + projections on both brains, restart, live journey: counts 132/1 unchanged, search, save, isolation, think on
+  local model. ~7 min of memory downtime. No rollback needed.
+- 2026-10-05 Behavior change found live: updating/deleting an EXISTING page now needs `expected_revision` (from get_page);
+  `request_id` must be a UUID. The agent adapts from the tool description/error; no fork change.
+- 2026-10-05 Independent verification (separate agent, real bot conversation via a test topic): ALL PASS 9/9 — versions,
+  nothing lost, 5/5 old memories, local think, bot save, bot update of an existing page (sent expected_revision unprompted),
+  bot recall, family isolation, cleanup. Note: the bot's first put_page used a non-UUID request_id, retried and succeeded.
+- 2026-10-05 Follow-ups added to .ai/roadmap.md per owner's picks.

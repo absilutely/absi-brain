@@ -11,9 +11,33 @@
  * methods. Auto-link config is the one impure helper (reads engine.getConfig).
  */
 
-import type { BrainEngine } from './engine.ts';
-import type { PageType } from './types.ts';
+import type { BrainEngine, LinkBatchInput } from './engine.ts';
+import type { PageType, EffectiveDateSource } from './types.ts';
 import { ensureWellFormed } from './text-safe.ts';
+import { stripCodeBlocks } from './markdown-code.ts';
+import { isValidSourceId } from './source-id.ts';
+import { parseInlineCitationTimelineEntries } from './timeline-citations.ts';
+import { isMaterializedMarkerLine } from './timeline-marker.ts';
+import { slugifyPath, slugifySegment } from './sync.ts';
+import { SLUG_WORD_CHARS, SLUG_VARIATION_SELECTORS_RE } from './cjk.ts';
+import { foldNonDecomposingLatin } from './latin-fold.ts';
+import { isIdentityEntity, sameEntityName } from './entities/resolve.ts';
+// #3190: pack-aware link typing. link-inference imports only manifest-v1
+// (zod) + redos-guard (node:vm) — no cycle back into this module.
+import type { SchemaPackManifest } from './schema-pack/manifest-v1.ts';
+import { inferLinkTypeFromPack, frontmatterLinkTypeFromPack, ownsAttendanceInference } from './schema-pack/link-inference.ts';
+import { PageRegexBudget } from './schema-pack/redos-guard.ts';
+
+/**
+ * #3190: the slice of a schema-pack manifest link extraction consumes.
+ * Callers thread the ACTIVE pack's manifest (loadActivePackForLocalEngine /
+ * loadActivePackBestEffort → `.manifest`); null/undefined keeps the legacy
+ * in-code inference exactly as before.
+ */
+export type LinkExtractionPack = Pick<SchemaPackManifest, 'link_types' | 'frontmatter_links'> & Partial<Pick<SchemaPackManifest, 'page_types'>>;
+
+export { stripCodeBlocks } from './markdown-code.ts';
+export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidate } from './timeline-citations.ts';
 
 /**
  * v0.42.7 — link-extraction version stamp. Bump this ISO timestamp whenever the
@@ -28,7 +52,47 @@ import { ensureWellFormed } from './text-safe.ts';
  * OR updated_at > links_extracted_at`. It is an ISO-8601 string (NOT a number) —
  * the column is TIMESTAMPTZ and the predicate binds it as `::timestamptz`.
  */
-export const LINK_EXTRACTOR_VERSION_TS = '2026-05-31T00:00:00Z';
+// 2026-10-02: eval wave N12-6 — a `Participants:` line (plain or bold) or a
+// `## Participants` section is attendance evidence like its `Attendees`
+// twin, so meeting pages written with it re-extract and gain attended edges.
+// 2026-10-01: eval wave N9-2/N9-3/N12-7 — schema-pack frontmatter mappings
+// keep FRONTMATTER_LINK_MAP's declared direction (company `investors:` is
+// investor -> company, meeting `attendees:` is person -> meeting), and a
+// pack's `attended` verb on a meeting page follows canonical evidence-gated
+// attendance, so edges the legacy gbrain-base pack stored backwards (or typed
+// attended from a notes mention) re-derive on `extract --stale`.
+// 2026-09-30: #5749 — with link_resolution.global_basename on, a unique
+// basename match resolves a frontmatter wikilink before the fuzzy and live
+// keyword steps, so edges the managed stale sweep re-pointed at a transcript
+// re-extract back to the named page on the next `extract --stale`.
+// 2026-09-30: #5765 — a bold `**Attendees:**` label before a bare link list is
+// attendance evidence (the meeting-ingestion template wrote it), so meeting
+// pages filed with it re-extract and gain their attended edges.
+// 2026-09-09: #4985 — normalizeBasename strips Unicode variation selectors (twin
+// of slugifySegment), so emoji+VS16 wikilinks re-resolve to the clean slug.
+// 2026-09-09 (same wave): #4977 — the page-role prior no longer applies to
+// links inside the machine-written list sections rolePriorSuppressedRanges
+// matches (Timeline, See also, Related, Facts, Sources, Links, Email mention
+// links, Backlinks, Significant moments), so pre-fix extractions re-run.
+// 2026-09-06: #4873 — pass 1b accepts a leading `./` (and, same wave, the
+// `../` / `./../` sibling forms + the folded bare-wikilink grammar), so pages
+// whose links were pruned by the sweep reconcile re-extract on `extract --stale`.
+// 2026-08-21: re-bumped for #2367 — normalizeBasename semantics changed
+// (non-Latin scripts kept, accents folded like the slug grammar), so
+// pre-#2367 extractions must re-run to pick up the newly-resolvable links.
+// Subsumes the 2026-08-19 fix-wave-i bump (#3466 unevidenced people/ ->
+// companies/ adjacency infers 'mentions', not 'works_at'; #2576 bug-2
+// DIR_PATTERN whitelist no longer drops non-whitelisted-directory links).
+// The watermark MUST NOT be in the future: the stamp path clamps
+// links_extracted_at up to the watermark (so a fresh extraction isn't
+// immediately re-listed), which means a future watermark masks concurrent
+// edits until that date — the exact race D4 guards (test/extract-stale.test.ts).
+// The converse limitation is inherent and accepted: a stamp written by
+// PRE-wave code after this date reads as fresh and won't re-extract until
+// the page is next edited; no fixed watermark can cover code that keeps
+// running past it.
+// 2026-10-02: hyphen-run basenames resolve (#5623); 2026-10-05: temporal edges derive dated evidence on extraction. Re-extract.
+export const LINK_EXTRACTOR_VERSION_TS = '2026-10-05T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -60,6 +124,35 @@ export interface EntityRef {
    * LinkCandidate per resolved match.
    */
   needsResolution?: boolean;
+  /**
+   * Number of leading `../` segments on the original markdown link (0 when
+   * absent or for engine-slug refs). The match regex strips the `../` run, so
+   * this preserves the relative depth for callers that know the linking page's
+   * slug (`extractPageLinks`) to resolve the target against the page's own
+   * directory. Without it, `[x](../concepts/x.md)` from a nested page resolves
+   * as the root-relative `concepts/x` instead of `<page-dir-parent>/concepts/x`
+   * — the reason subtree-scoped / nested brains got zero cross-dir edges.
+   */
+  upLevels?: number;
+  /**
+   * #3190: set for a same-directory markdown link — `[Name](slug.md)` with
+   * no directory segment and no scheme. `slug` holds the target basename
+   * (`.md` stripped); the caller (`extractPageLinks`) resolves it against
+   * the LINKING page's directory, mirroring the FS path's `resolveSlug`.
+   * Pre-fix these refs were silently dropped (pass 1 requires `dir/`),
+   * so flat directories and sibling links produced zero DB-path edges.
+   */
+  sameDir?: boolean;
+  /**
+   * Char offset of the link match in the page content
+   * (stripCodeBlocks and the pass masks are length-preserving, so the
+   * offset is valid against the original content). Lets extractPageLinks
+   * anchor the context window and the Timeline/See-also role-prior
+   * suppression at the ACTUAL link, not at the first occurrence of the
+   * display text — a Timeline link whose display name also appears in the
+   * bio used to anchor early and take the bio's typing.
+   */
+  index?: number;
 }
 
 /**
@@ -77,16 +170,30 @@ export const WIKILINK_BASENAME_LINK_TYPE = 'wikilink_basename';
 export type LinkResolutionType = 'qualified' | 'unqualified';
 
 /**
- * Directory prefix whitelist. These are the top-level slug dirs the extractor
- * recognizes as entity references. Upstream canonical + our extensions:
- *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects
- *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
- *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
+ * Directory prefix whitelist. These are the canonical top-level slug dirs
+ * (gbrain-base pack dirs + historical extensions). #2576 (bug 2): this list
+ * is NO LONGER a drop-gate for markdown links, bare-slug prose refs, or
+ * slash-shaped wikilinks — those now match ANY_DIR_SEGMENT and rely on the
+ * downstream page-existence checks that every persist path already runs
+ * (resolveCandidateSources in extract.ts, the allSlugs filter in put_page
+ * auto-link, and addLinksBatch's INNER JOINs as the final backstop). The
+ * whitelist survives only as the typed fast-path for pass-2b wikilinks;
+ * non-whitelisted `[[dir/...]]` get equivalent treatment in pass 2c.
  */
-const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
+const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|reference)';
 
 /**
- * Match `[Name](path)` markdown links pointing to entity directories.
+ * #2576 (bug 2): a plausible top-level slug directory — lowercase alnum
+ * with dashes/underscores, digit-leading allowed (`90-people`). Used where
+ * the hardcoded DIR_PATTERN whitelist used to silently drop every
+ * user-invented directory (`ops/`, `notes/`, custom schema-pack dirs).
+ * Candidates matched through this are validated for page existence
+ * downstream, so a wider net creates no dead edges — only candidates.
+ */
+const ANY_DIR_SEGMENT = '[a-z0-9][a-z0-9_-]*';
+
+/**
+ * Match `[Name](path)` markdown links pointing at page-shaped paths.
  * Accepts both filesystem-relative format (`[Name](../people/slug.md)`)
  * AND engine-slug format (`[Name](people/slug)`).
  *
@@ -94,9 +201,14 @@ const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|pr
  *
  * The regex permits an optional `../` prefix (any number) and an optional
  * `.md` suffix so the same function works for both filesystem and DB content.
+ *
+ * #2576 (bug 2): the first segment is ANY_DIR_SEGMENT, not the DIR_PATTERN
+ * whitelist — `[Pointer](../ops/services/pointer-agent.md)` must produce a
+ * candidate for a brain that has an `ops/` directory. Nonexistent targets
+ * are dropped by the callers' existence checks, exactly as before.
  */
 const ENTITY_REF_RE = new RegExp(
-  `\\[([^\\]]+)\\]\\((?:\\.\\.\\/)*(${DIR_PATTERN}\\/[^)\\s]+?)(?:\\.md)?\\)`,
+  `\\[([^\\]]+)\\]\\((?:/|(?:\\.\\.\\/)*)(${ANY_DIR_SEGMENT}\\/[^)\\s#]+?)(?:\\.md)?(?:#[^)]*)?\\)`,
   'g',
 );
 
@@ -126,7 +238,7 @@ const WIKILINK_RE = new RegExp(
  * anyway, but the two-pass approach keeps intent crystal-clear).
  */
 const QUALIFIED_WIKILINK_RE = new RegExp(
-  `\\[\\[([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?):(${DIR_PATTERN}\\/[^|\\]#]+?)(?:#[^|\\]]*?)?(?:\\|([^\\]]+?))?\\]\\]`,
+  `\\[\\[([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?):([^|\\]#\\n[]+?)(?:#[^|\\]]*?)?(?:\\|([^\\]]+?))?\\]\\]`,
   'g',
 );
 
@@ -163,40 +275,23 @@ const WIKILINK_GENERIC_RE = /\[\[([^|\]#\n[]+?)(?:#[^|\]]*?)?(?:\|([^\]]+?))?\]\
 const MARKDOWN_LABEL_WIKILINK_RE = /\[[^\]\n]*\[\[[^\]\n]+\]\][^\]\n]*\]\([^)\n]+\)/g;
 
 /**
- * Strip fenced code blocks (```...```) and inline code (`...`) from markdown,
- * replacing them with whitespace of equivalent length. Preserves byte offsets
- * for any caller that cares about positions; for our extractors this is just
- * defense-in-depth — slugs inside code are not real entity references.
+ * #3190: same-directory markdown link — `[Name](slug.md)` whose target has
+ * NO directory segment and NO scheme (`/`, `:` excluded). A trailing
+ * `#anchor` is stripped (#4995), as every wikilink regex here already does.
+ * #4873: an explicit `./` prefix (`[Name](./slug.md)`, `[Name](./sub/x.md)`)
+ * is the same page-dir-relative intent — the FS walker's join() eats it — so
+ * the relative arm admits `/` in the tail. The arm takes ANY leading run of
+ * `./` / `../` segments (`[Name](../slug.md)`, `[Name](./../slug.md)`): pass 1
+ * only claims `../` targets that carry a directory segment, so a parent-dir
+ * sibling link had no DB candidate at all while the FS walker's join() linked
+ * it — the sweep reconcile then pruned the edge (same class as #4873).
+ * Captures: name, dot-prefix run, relative tail, bare tail. The `.md` suffix
+ * is REQUIRED (mirrors the FS extractor's mdPattern) so bare parenthetical
+ * prose (`[sic](reference)`) never produces a ref. Resolution against the
+ * linking page's directory happens in extractPageLinks (this module has no
+ * page context here).
  */
-export function stripCodeBlocks(content: string): string {
-  let out = '';
-  let i = 0;
-  while (i < content.length) {
-    // Fenced block: ``` (optional language) ... ```
-    if (content.startsWith('```', i)) {
-      const end = content.indexOf('```', i + 3);
-      if (end === -1) { out += ' '.repeat(content.length - i); break; }
-      out += ' '.repeat(end + 3 - i);
-      i = end + 3;
-      continue;
-    }
-    // Inline code: `...` (single backtick, no newline inside)
-    if (content[i] === '`') {
-      const end = content.indexOf('`', i + 1);
-      if (end === -1 || content.slice(i + 1, end).includes('\n')) {
-        out += content[i];
-        i++;
-        continue;
-      }
-      out += ' '.repeat(end + 1 - i);
-      i = end + 1;
-      continue;
-    }
-    out += content[i];
-    i++;
-  }
-  return out;
-}
+const SAME_DIR_MD_RE = /\[([^\]]+)\]\((?:((?:\.{1,2}\/)+)([^):#\s]+?)|([^)/:#\s]+?))\.md(?:#[^)]*)?\)/g;
 
 /**
  * A code-reference found in markdown prose. Created by extractCodeRefs and
@@ -219,7 +314,7 @@ export interface CodeRef {
 // The extension list is aligned with detectCodeLanguage in chunkers/code.ts.
 // Paths NOT matching these extensions are ignored because they wouldn't
 // have a code page to edge to anyway.
-const CODE_REF_REGEX = /\b((?:src|lib|app|test|tests|scripts|docs|packages|internal|cmd|examples)\/[\w\-./]+\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|rb|go|rs|java|cs|cpp|cc|hpp|c|h|php|swift|kt|scala|lua|ex|exs|elm|ml|dart|zig|sol|sh|bash|css|html|vue|json|yaml|yml|toml))(?::(\d+))?\b/g;
+const CODE_REF_REGEX = /\b((?:src|lib|app|test|tests|scripts|docs|packages|internal|cmd|examples)\/[\w\-./]+\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|rb|go|rs|java|cs|cpp|cc|hpp|c|h|php|swift|kt|scala|lua|ex|exs|elm|ml|dart|zig|sol|sh|bash|css|html|astro|svelte|vue|json|yaml|yml|toml))(?::(\d+))?\b/g;
 
 /**
  * Extract code-path references (e.g. 'src/core/sync.ts:42') from markdown
@@ -311,11 +406,54 @@ export function extractEntityRefs(content: string): EntityRef[] {
   const mdPattern = new RegExp(ENTITY_REF_RE.source, ENTITY_REF_RE.flags);
   while ((match = mdPattern.exec(stripped)) !== null) {
     const name = match[1];
-    const fullPath = match[2];
+    let fullPath = match[2];
+    // Obsidian's useMarkdownLinks mode percent-encodes link targets
+    // (`[Alice](people/alice%20chen)`). Decode before resolution; a
+    // malformed escape keeps the raw text rather than throwing.
+    if (fullPath.includes('%')) {
+      try { fullPath = decodeURIComponent(fullPath); } catch { /* keep raw */ }
+    }
     const slug = fullPath;
     const dir = fullPath.split('/')[0];
-    refs.push({ name, slug, dir });
+    // The regex strips the leading `../` run from `fullPath`; recover its depth
+    // from the raw link target so extractPageLinks can resolve relative to the
+    // linking page's directory. `[x](path)` has no `](` collision because the
+    // capture stops before the first unescaped `)`.
+    const rawTarget = match[0].slice(match[0].indexOf('](') + 2, -1);
+    const up = rawTarget.match(/^(?:\.\.\/)+/);
+    const ref: EntityRef = { name, slug, dir };
+    // Only relative links carry depth; absolute / engine-slug refs keep the
+    // exact {name, slug, dir} shape (no upLevels key) so equality consumers
+    // are unaffected.
+    if (up) ref.upLevels = up[0].length / 3;
+    ref.index = match.index;
+    refs.push(ref);
     markdownRanges.push([match.index, match.index + match[0].length]);
+  }
+
+  // 1b. #3190/#4873: same-directory markdown links — `[Name](slug.md)`,
+  //     `[Name](./slug.md)`, `[Name](../slug.md)` (no scheme). Pass 1 requires
+  //     a `dir/` segment, so sibling and dot-relative links were silently
+  //     dropped on the DB path while the FS walker (extractMarkdownLinks →
+  //     resolveSlug) linked them. Tagged `sameDir: true`; the `..` depth of
+  //     the prefix rides on `upLevels` and extractPageLinks resolves against
+  //     the page's dir. A `../dir/x.md` span pass 1 already claimed is skipped
+  //     so the two passes never double-emit.
+  const sameDirPattern = new RegExp(SAME_DIR_MD_RE.source, SAME_DIR_MD_RE.flags);
+  while ((match = sameDirPattern.exec(stripped)) !== null) {
+    const at = match.index;
+    if (markdownRanges.some(([s, e]) => at >= s && at < e)) continue;
+    const name = match[1];
+    let target = match[3] ?? match[4];
+    if (target.includes('%')) {
+      try { target = decodeURIComponent(target); } catch { /* keep raw */ }
+    }
+    const ref: EntityRef = { name, slug: target, dir: '', sameDir: true };
+    const ups = match[2] ? match[2].split('/').filter(seg => seg === '..').length : 0;
+    if (ups) ref.upLevels = ups;
+    ref.index = at;
+    refs.push(ref);
+    markdownRanges.push([at, at + match[0].length]);
   }
 
   // 2a. v0.17.0 qualified wikilinks: [[source-id:path]] or [[source-id:path|Display]]
@@ -325,13 +463,13 @@ export function extractEntityRefs(content: string): EntityRef[] {
   const qualPattern = new RegExp(QUALIFIED_WIKILINK_RE.source, QUALIFIED_WIKILINK_RE.flags);
   while ((match = qualPattern.exec(stripped)) !== null) {
     const sourceId = match[1];
-    let slug = match[2].trim();
+    let slug = stripEscapedPipeTail(match[2].trim());
     if (!slug) continue;
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[3] || slug).trim();
     const dir = slug.split('/')[0];
-    refs.push({ name: displayName, slug, dir, sourceId });
+    refs.push({ name: displayName, slug, dir, sourceId, index: match.index });
     qualifiedRanges.push([match.index, match.index + match[0].length]);
   }
 
@@ -341,13 +479,13 @@ export function extractEntityRefs(content: string): EntityRef[] {
   const unmasked = maskRanges(stripped, qualifiedRanges);
   const wikiPattern = new RegExp(WIKILINK_RE.source, WIKILINK_RE.flags);
   while ((match = wikiPattern.exec(unmasked)) !== null) {
-    let slug = match[1].trim();
+    let slug = stripEscapedPipeTail(match[1].trim());
     if (!slug) continue;
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[2] || slug).trim();
     const dir = slug.split('/')[0];
-    refs.push({ name: displayName, slug, dir });
+    refs.push({ name: displayName, slug, dir, index: match.index });
     unqualifiedRanges.push([match.index, match.index + match[0].length]);
   }
 
@@ -372,17 +510,31 @@ export function extractEntityRefs(content: string): EntityRef[] {
   );
   const genericPattern = new RegExp(WIKILINK_GENERIC_RE.source, WIKILINK_GENERIC_RE.flags);
   while ((match = genericPattern.exec(genericMasked)) !== null) {
-    let slug = match[1].trim();
+    let slug = stripEscapedPipeTail(match[1].trim());
     if (!slug) continue;
     if (slug.includes('://')) continue;
     if (slug.includes(':')) continue; // qualified-syntax token; 2a owns these
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[2] || slug).trim();
     const dir = slug.includes('/') ? slug.split('/')[0] : '';
-    refs.push({ name: displayName, slug, dir, needsResolution: true });
+    refs.push({ name: displayName, slug, dir, needsResolution: true, index: match.index });
   }
 
   return refs;
+}
+
+/**
+ * #4062: strip the trailing backslash(es) an escaped pipe leaves on a
+ * wikilink target. Inside a markdown table cell the pipe separating the
+ * target from its display alias MUST be escaped (`[[dir/slug\|Alias]]`,
+ * Obsidian's own table syntax) or it would end the cell. The wikilink
+ * slug captures stop at the literal `|`, so the escape backslash lands as
+ * the final character of the captured target — a slug shape that can
+ * never match a real page. Slugs never legitimately contain backslashes,
+ * so stripping the trailing run is lossless. Applied to passes 2a/2b/2c.
+ */
+function stripEscapedPipeTail(slug: string): string {
+  return slug.replace(/\\+$/, '');
 }
 
 /**
@@ -399,9 +551,33 @@ function maskRanges(content: string, ranges: Array<[number, number]>): string {
   return chars.join('');
 }
 
+/**
+ * Resolve a markdown ref's target against the LINKING page's directory when the
+ * original link was relative (had one or more `../`). Filesystem markdown links
+ * are relative to the file that contains them: `[x](../concepts/x.md)` from a
+ * page at `wiki/sources/foo` points at `wiki/concepts/x`, not the root-relative
+ * `concepts/x`. The match regex discards the `../` run, so `ref.upLevels` carries
+ * the depth and this reconstructs the absolute page slug.
+ *
+ * Backward-compatible: for a page one level below the root (`meetings/m` +
+ * `../people/alice` → `people/alice`) the parent walk lands exactly at the root,
+ * so the result is identical to the old `../`-stripping behavior. It only
+ * diverges — correctly — when the linking page is nested deeper than the `../`
+ * count unwinds, i.e. content under a prefix (subtree-scoped sources). An over-
+ * long `../` run clamps at the root. Absolute refs (upLevels 0, e.g. engine-slug
+ * `people/x` or `[[wikilinks]]`) are returned unchanged.
+ */
+function resolveRelativeSlug(pageSlug: string, ref: EntityRef): string {
+  if (!ref.upLevels || ref.upLevels <= 0) return ref.slug;
+  const dirSegs = pageSlug.includes('/') ? pageSlug.split('/').slice(0, -1) : [];
+  const keep = Math.max(0, dirSegs.length - ref.upLevels);
+  return [...dirSegs.slice(0, keep), ref.slug].join('/');
+}
+
 // ─── Link candidates (richer than EntityRef) ────────────────────
 
 export interface LinkCandidate {
+  canonicalAttendance?: boolean;
   /**
    * Source page slug for the edge. When omitted, callers default to
    * "the page being written" (operations.ts runAutoLink) or "the page
@@ -413,6 +589,7 @@ export interface LinkCandidate {
   fromSlug?: string;
   /** Target page slug (no .md, no ../). */
   targetSlug: string;
+  targetSourceId?: string;
   /** Inferred relationship type. */
   linkType: string;
   /** Surrounding text (up to ~80 chars) used for inference + storage. */
@@ -443,6 +620,7 @@ export interface LinkCandidate {
 export interface PageLinksResult {
   candidates: LinkCandidate[];
   unresolved: UnresolvedFrontmatterRef[];
+  attendanceComplete: boolean;
 }
 
 /**
@@ -468,12 +646,94 @@ export async function extractPageLinks(
   frontmatter: Record<string, unknown>,
   pageType: PageType,
   resolver: SlugResolver,
-  opts: { globalBasename?: boolean; skipFrontmatter?: boolean } = {},
+  opts: { globalBasename?: boolean; skipFrontmatter?: boolean; pack?: LinkExtractionPack | null;
+    targetType?: (slug: string, sourceId?: string) => string | undefined;
+    onResolvedFrontmatterTarget?: (slug: string) => void } = {},
 ): Promise<PageLinksResult> {
   const candidates: LinkCandidate[] = [];
 
+  // #3190: pack-aware verb inference. Pack-declared verbs win (page-type
+  // bindings, then pack regexes under the shared per-page ReDoS budget);
+  // the in-code inferLinkType stays the fall-through for everything the
+  // pack doesn't claim — matching the resolution order extract-ner already
+  // ships (schema-pack/link-inference.ts header). Pre-fix a user pack's
+  // `link_types[].inference.regex` (e.g. parent_of) was silently ignored
+  // here and every such edge landed as 'mentions'.
+  const pack = opts.pack ?? null;
+  const packBudget = pack ? new PageRegexBudget() : undefined;
+  const packOwnsAttendance = ownsAttendanceInference(pack);
+  // Timeline / See-also links never receive the page-role prior — see
+  // rolePriorSuppressedRanges (matched on the code-stripped content, so a
+  // fenced `## Timeline` never opens a range). idx is the link's position in
+  // `content` (stripCodeBlocks and the wikilink mask are length-preserving,
+  // so indices line up); idx < 0 / undefined keeps the old behavior.
+  const suppressedRanges = rolePriorSuppressedRanges(stripCodeBlocks(content));
+  const attendanceRanges = attendanceEvidenceRanges(content);
+  const attendancePending = new Set<number>();
+  const attendanceResolved = new Set<number>();
+  const attendanceAmbiguous = new Set<number>();
+  const typeFor = (ctx: string, targetSlug: string, idx?: number, sourceId?: string, bodyReference = true): Pick<LinkCandidate, 'linkType' | 'canonicalAttendance'> => {
+    const targetType = opts.targetType?.(targetSlug, sourceId);
+    if (pack) {
+      const packVerb = inferLinkTypeFromPack(pack, pageType as string, ctx, packBudget, targetType);
+      if (packVerb && (packOwnsAttendance || packVerb !== 'attended' || pageType !== 'meeting')) {
+        if (packVerb === 'attended' && pageType === 'meeting'
+          && (opts.targetType ? targetType !== 'person' : !targetSlug.startsWith('people/'))) return { linkType: 'mentions' };
+        return { linkType: packVerb };
+      }
+    }
+    if (pageType === 'meeting') {
+      if (!bodyReference) return { linkType: 'mentions' };
+      if (packOwnsAttendance && pack?.link_types.some(lt => lt.name === 'attended' && (lt.inference?.page_type || lt.inference?.target_type))) return { linkType: 'mentions' };
+      if (idx !== undefined && hasAttendanceEvidence(attendanceRanges, idx)) {
+        attendancePending.add(idx);
+        if (!opts.targetType || targetType !== undefined) attendanceResolved.add(idx);
+      }
+      if ((opts.targetType ? targetType === 'person' : targetSlug.startsWith('people/'))
+        && idx !== undefined && hasAttendanceEvidence(attendanceRanges, idx)) {
+        return { linkType: 'attended', canonicalAttendance: true };
+      }
+      return { linkType: 'mentions' };
+    }
+    const suppressPrior = idx !== undefined && idx >= 0 && inSuppressedRange(suppressedRanges, idx);
+    const legacy = inferLinkType(pageType, ctx, suppressPrior ? undefined : content, targetSlug,
+      opts.targetType ? targetType ?? null : undefined);
+    if (pack?.link_types.some(lt => lt.name === legacy && (lt.inference?.page_type || lt.inference?.target_type))) return { linkType: 'mentions' };
+    return { linkType: legacy };
+  };
+
   // 1. Markdown entity refs.
   for (const ref of extractEntityRefs(content)) {
+    // #3190: same-directory markdown link — resolve against THIS page's
+    // directory (the FS path's resolveSlug does exactly this via
+    // join(fileDir, target)). Slugified through the sync grammar so
+    // `[Alice](Alice%20Chen.md)` reaches `people/alice-chen`. Downstream
+    // existence checks drop targets that aren't pages.
+    if (ref.sameDir) {
+      const segs = slug.includes('/') ? slug.split('/').slice(0, -1) : [];
+      // `../` / `./../` prefixes (upLevels) and any mid-path `.`/`..` fold
+      // the way the FS walker's join() does; a run that would climb above
+      // the root is a dangling link there too, so it yields no candidate.
+      let climbed = false;
+      for (const seg of ('../'.repeat(ref.upLevels ?? 0) + ref.slug).split('/')) {
+        if (seg === '' || seg === '.') continue;
+        if (seg !== '..') { segs.push(seg); continue; }
+        if (segs.length === 0) { climbed = true; break; }
+        segs.pop();
+      }
+      const target = climbed ? '' : slugifyPath(segs.join('/'));
+      if (target && target !== slug) {
+        const idx = ref.index ?? content.indexOf(ref.name);
+        const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
+        candidates.push({
+          targetSlug: target,
+          ...typeFor(context, target, idx),
+          context,
+          linkSource: 'markdown',
+        });
+      }
+      continue;
+    }
     // Issue #972: refs from the generic `[[bare-name]]` pass carry the
     // literal wikilink text, not a real page slug. When global_basename
     // mode is on AND the resolver implements basename lookup, resolve
@@ -482,50 +742,140 @@ export async function extractPageLinks(
     // pre-v0.40.8.2 behavior of dropping bare wikilinks outside
     // DIR_PATTERN.
     if (ref.needsResolution) {
-      if (!opts.globalBasename || typeof resolver.resolveBasenameMatches !== 'function') {
-        continue;
+      const slashIdx = ref.slug.lastIndexOf('/');
+      // #2576 (bug 2): a slash-shaped wikilink outside DIR_PATTERN
+      // (`[[ops/services/pointer-agent]]`) gets the SAME treatment a
+      // whitelisted dir gets from pass 2b — a direct, verb-typed candidate
+      // for the literal path, emitted regardless of the global_basename
+      // flag. Downstream existence checks (resolveCandidateSources /
+      // put_page's allSlugs filter / addLinksBatch's INNER JOINs) drop it
+      // when no such page exists, exactly as they do for 2b candidates.
+      // Pre-fix these refs were silently dropped (flag off) or demoted to
+      // untyped wikilink_basename edges (flag on).
+      if (slashIdx !== -1 && ref.slug !== slug) {
+        const litIdx = ref.index ?? content.indexOf(ref.slug);
+        const litContext = litIdx >= 0 ? excerpt(content, litIdx, 240) : ref.name;
+        candidates.push({
+          targetSlug: ref.slug,
+          ...typeFor(litContext, ref.slug, litIdx),
+          context: litContext,
+          linkSource: 'markdown',
+        });
+      }
+      // #4062: a bare `[[name]]` (no slash) gets a direct verb-typed
+      // candidate for its root-exact slugified form, emitted regardless of
+      // the global_basename flag — mirroring the FS path, where resolveSlug's
+      // ancestor walk resolves `[[x]]` to a root page `x` before the
+      // basename fallback ever runs. Pre-fix the DB path dropped these
+      // entirely flag-off (0 candidates) while the FS path linked them.
+      // Downstream existence checks (resolveCandidateSources / put_page's
+      // allSlugs filter / addLinksBatch's INNER JOINs) drop the candidate
+      // when no root page exists, exactly as for slash-shaped refs above.
+      // #4855 twin: both slug grammars — sync's slugifyPath keeps stroke
+      // letters (`đuc-example`), normalizeBasename folds them (`duc-example`)
+      // — so `[[Đức Example]]` reaches whichever root page exists with the
+      // flag off. Exact slugs only; downstream existence checks drop the miss.
+      const bareDirect = new Set<string>();
+      if (slashIdx === -1) {
+        for (const form of [slugifyPath(ref.slug), normalizeBasename(ref.slug)]) {
+          if (form && form !== slug) bareDirect.add(form);
+        }
       }
       // Issue #972 (codex): resolve by the wikilink TARGET (ref.slug — the
       // text inside `[[...]]` before any `|`), NOT the display alias
       // (ref.name = match[2]). `[[struktura|the project]]` must resolve
       // `struktura`, not "the project". The display text is for context only.
-      const matches = await resolver.resolveBasenameMatches(ref.slug);
-      if (matches.length === 0) continue;
-      const idx = content.indexOf(ref.slug);
+      //
+      // Issue #1964: a dir-qualified wikilink (`[[llm-wiki/entities/AI 3.0]]`)
+      // carries a raw Obsidian path while page slugs are sync-slugified
+      // (`llm-wiki/entities/ai-3.0`). Slugify the path the same way sync does,
+      // then match by exact slug or path-suffix (wiki-root-relative authoring).
+      // This runs regardless of global_basename — it's dir-qualified, so the
+      // cross-dir false-positive risk the flag guards against doesn't apply.
+      // Mirrors the FS path's resolveSlug ancestor walk. Bare `[[name]]`
+      // wikilinks still require the global_basename flag.
+      // The EXACT raw literal is excluded — the direct typed candidate
+      // above already covers it (#2576), so keeping it would double-emit.
+      let matches: string[] = [];
+      const slugified = ref.slug.includes('/') ? slugifyPath(ref.slug) : '';
+      if (resolver.resolveBasenameMatches && slugified.includes('/')) {
+        const tail = slugified.slice(slugified.lastIndexOf('/') + 1);
+        matches = (await resolver.resolveBasenameMatches(tail))
+          .filter(m => m !== ref.slug && (m === slugified || m.endsWith(`/${slugified}`)));
+      } else if (resolver.resolveBasenameMatches && opts.globalBasename) {
+        // #4062: exclude the root-exact slugified form — the direct typed
+        // candidate above already covers it (same rule the dir-qualified
+        // branch applies to its raw literal). Keeping it would double-emit.
+        matches = (await resolver.resolveBasenameMatches(ref.slug))
+          .filter(m => !bareDirect.has(m));
+      }
+      matches = matches.filter(matched => matched !== slug);
+      const idx = ref.index ?? content.indexOf(ref.slug);
       const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
+      const targets = [...new Set([...bareDirect, ...matches])];
+      const personTargets = targets.filter(target => opts.targetType
+        ? opts.targetType(target) === 'person' : target.startsWith('people/'));
+      const uniquePerson = personTargets.length === 1;
+      if (pageType === 'meeting' && opts.targetType && !uniquePerson
+        && targets.filter(target => opts.targetType!(target) !== undefined).length > 1) attendanceAmbiguous.add(idx);
+      for (const target of bareDirect) {
+        const inferred = typeFor(context, target, idx);
+        candidates.push({ targetSlug: target,
+          ...(inferred.canonicalAttendance && !uniquePerson ? { linkType: 'mentions' } : inferred),
+          context, linkSource: 'markdown' });
+      }
       for (const matched of matches) {
-        // Issue #972 (codex [P2]): a basename `[[own-tail]]` on its own page
-        // resolves back to itself — drop the self-loop.
-        if (matched === slug) continue;
+        const inferred = typeFor(context, matched, idx);
         candidates.push({
           targetSlug: matched,
-          linkType: WIKILINK_BASENAME_LINK_TYPE,
+          ...(inferred.canonicalAttendance && uniquePerson ? inferred : { linkType: WIKILINK_BASENAME_LINK_TYPE }),
           context,
           linkSource: 'wikilink-resolved',
         });
       }
       continue;
     }
-    const idx = content.indexOf(ref.name);
+    // Anchor at the ref's true match offset when the pass
+    // recorded one — first-occurrence-of-display-text anchoring let a
+    // Timeline link inherit the bio's context (and its verb typing).
+    const idx = ref.index ?? content.indexOf(ref.name);
     // Wider context window (240 chars vs original 80) catches verbs that
     // appear at sentence-or-paragraph distance from the slug — common in
     // narrative prose where a partner's investment verbs appear once and
     // then portfolio companies are listed in subsequent sentences.
     const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
+    // Relative markdown links resolve against THIS page's directory (fixes
+    // cross-dir edges for nested / subtree-scoped content); absolute refs pass
+    // through unchanged. #4995: lowercased (pass-1 markdown + 2a/2b wikilink
+    // refs) — validateSlug stores every slug lowercase on both engines, so a
+    // mixed-case candidate could never resolve. NOT slugifyPath: it strips
+    // characters validateSlug permits and would mangle a legit put_page slug.
+    const targetSlug = resolveRelativeSlug(slug, ref).toLowerCase();
     candidates.push({
-      targetSlug: ref.slug,
-      linkType: inferLinkType(pageType, context, content, ref.slug),
+      targetSlug,
+      targetSourceId: ref.sourceId ?? undefined,
+      ...typeFor(context, targetSlug, idx, ref.sourceId ?? undefined),
       context,
       linkSource: 'markdown',
     });
   }
 
   // 2. Bare slug references (e.g. "see people/alice-chen for context").
-  // Limited to the same entity directories ENTITY_REF_RE covers.
+  // #2576 (bug 2): any dir-shaped path, not just the DIR_PATTERN whitelist —
+  // `see ops/services/pointer-agent` must produce a candidate. Prose noise
+  // that happens to look like a path (`on/off`, `com/foo/bar` inside a URL)
+  // is dropped by the callers' page-existence checks, never persisted.
   // Code blocks are stripped first — slugs in code samples are not real refs.
-  const strippedContent = stripCodeBlocks(content);
+  // Wikilink spans are masked too (equal-length blanks, so match indices stay
+  // valid for excerpt()): the wikilink pass above owns `[[...]]` interiors,
+  // and without the mask a dir-qualified wikilink like
+  // `[[llm-wiki/entities/AI 3.0]]` leaves its lowercase prefix
+  // `llm-wiki/entities` as a bare-path match — a spurious edge to the parent
+  // page whenever that page exists.
+  const strippedContent = stripCodeBlocks(content)
+    .replace(/\[\[[^\]]*\]\]/g, (s) => ' '.repeat(s.length));
   const bareRe = new RegExp(
-    `\\b(${DIR_PATTERN}\\/[a-z0-9][a-z0-9/-]*[a-z0-9])\\b`,
+    `\\b(${ANY_DIR_SEGMENT}\\/[a-z0-9][a-z0-9/-]*[a-z0-9])\\b`,
     'g',
   );
   let m: RegExpExecArray | null;
@@ -533,10 +883,13 @@ export async function extractPageLinks(
     // Skip matches that are part of a markdown link (already handled above).
     const charBefore = m.index > 0 ? strippedContent[m.index - 1] : '';
     if (charBefore === '/' || charBefore === '(') continue;
+    // #2576: never emit a self-loop for a page mentioning its own slug.
+    if (m[1] === slug) continue;
     const context = excerpt(strippedContent, m.index, 240);
+    const inferred = typeFor(context, m[1], m.index, undefined, false);
     candidates.push({
       targetSlug: m[1],
-      linkType: inferLinkType(pageType, context, content, m[1]),
+      ...(inferred.canonicalAttendance ? { linkType: 'mentions' } : inferred),
       context,
       linkSource: 'markdown',
     });
@@ -551,10 +904,13 @@ export async function extractPageLinks(
   // synthetic `nullResolver`; that pattern broke once the bare-wikilink
   // path needed `resolveBasenameMatches` on the real resolver.
   let fmUnresolved: UnresolvedFrontmatterRef[] = [];
+  let frontmatterAttendanceComplete = true;
   if (!opts.skipFrontmatter) {
-    const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver);
+    const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver, opts.globalBasename, pack, opts.targetType,
+      opts.onResolvedFrontmatterTarget);
     candidates.push(...fm.candidates);
     fmUnresolved = fm.unresolved;
+    frontmatterAttendanceComplete = fm.attendanceComplete;
   }
 
   // Within-page dedup: same (fromSlug, targetSlug, linkType, linkSource)
@@ -568,12 +924,156 @@ export async function extractPageLinks(
   const seen = new Set<string>();
   const result: LinkCandidate[] = [];
   for (const c of candidates) {
-    const key = `${c.fromSlug ?? ''}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? ''}`;
+    const key = `${c.fromSlug ?? ''}\u0000${c.targetSourceId ?? ''}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? ''}\u0000${c.canonicalAttendance ?? false}`;
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(c);
   }
-  return { candidates: result, unresolved: fmUnresolved };
+  return { candidates: result, unresolved: fmUnresolved,
+    attendanceComplete: [...attendancePending].every(index => attendanceResolved.has(index) && !attendanceAmbiguous.has(index))
+      && frontmatterAttendanceComplete };
+}
+
+export function resolvedLinkCandidate(candidate: LinkCandidate, originSlug: string, originSourceId: string,
+  resolved: { fromSlug: string; fromSourceId: string; toSourceId: string }): LinkBatchInput {
+  const row = {
+    from_slug: resolved.fromSlug, to_slug: candidate.targetSlug,
+    from_source_id: resolved.fromSourceId, to_source_id: resolved.toSourceId,
+    link_type: candidate.linkType, context: candidate.context, link_source: candidate.linkSource,
+    origin_slug: candidate.canonicalAttendance ? originSlug : candidate.originSlug,
+    origin_source_id: originSourceId, origin_field: candidate.originField,
+  };
+  return candidate.canonicalAttendance ? orientCanonicalAttendance(row) : row;
+}
+
+export function orientCanonicalAttendance<T extends LinkBatchInput>(row: T): T {
+  return { ...row, from_slug: row.to_slug, to_slug: row.from_slug,
+    from_source_id: row.to_source_id, to_source_id: row.from_source_id,
+    origin_slug: row.from_slug, origin_source_id: row.from_source_id };
+}
+
+/**
+ * Extract markdown links to .md files (relative paths only).
+ *
+ * Handles two syntaxes:
+ *   1. Standard markdown:  [text](relative/path.md)
+ *   2. Wikilinks:          [[relative/path]] or [[relative/path|Display Text]]
+ *
+ * Both are resolved relative to the file that contains them. External URLs
+ * (containing ://) are always skipped. Section anchors (#heading) are stripped
+ * from both (#4995); for wikilinks, the .md suffix is added if absent.
+ */
+export function extractMarkdownLinks(content: string, positions = false): { name: string; relTarget: string; index?: number }[] {
+  const results: { name: string; relTarget: string; index?: number }[] = [];
+
+  const mdPattern = /\[([^\]]+)\]\(([^)#]+\.md)(?:#[^)]*)?\)/g;
+  let match;
+  while ((match = mdPattern.exec(content)) !== null) {
+    let target = match[2];
+    if (target.includes('://')) continue;
+    // Obsidian's useMarkdownLinks mode percent-encodes link targets
+    // (`[Alice](People/Alice%20Chen.md)`). Decode before resolution; a
+    // malformed escape keeps the raw text rather than throwing.
+    if (target.includes('%')) {
+      try { target = decodeURIComponent(target); } catch { /* keep raw */ }
+    }
+    results.push({ name: match[1], relTarget: target, ...(positions ? { index: match.index } : {}) });
+  }
+
+  const wikiPattern = /\[\[([^|\]]+?)(?:\|[^\]]*?)?\]\]/g;
+  while ((match = wikiPattern.exec(content)) !== null) {
+    const rawPath = match[1].trim();
+    if (rawPath.includes('://')) continue;
+    const hashIdx = rawPath.indexOf('#');
+    const pagePath = hashIdx >= 0 ? rawPath.slice(0, hashIdx) : rawPath;
+    if (!pagePath) continue;
+    const relTarget = pagePath.endsWith('.md') ? pagePath : pagePath + '.md';
+    const pipeIdx = match[0].indexOf('|');
+    const displayName = pipeIdx >= 0 ? match[0].slice(pipeIdx + 1, -2).trim() : rawPath;
+    results.push({ name: displayName, relTarget, ...(positions ? { index: match.index } : {}) });
+  }
+
+  return results;
+}
+
+export function attendanceEvidenceRanges(content: string): Array<[number, number]> {
+  const comments: Array<[number, number]> = [];
+  let visible = '', afterComment = 0;
+  const masked = stripCodeBlocks(content, { onHtmlComment(start, end) {
+    comments.push([start, end]);
+    visible += content.slice(afterComment, start) + content.slice(start, end).replace(/[^\r\n]/g, ' ');
+    afterComment = end;
+  } });
+  visible += content.slice(afterComment);
+  const lines: Array<{ text: string; start: number; end: number }> = [];
+  let start = 0;
+  for (const text of visible.split('\n')) {
+    lines.push({ text, start, end: start + text.length });
+    start += text.length + 1;
+  }
+  const list = (text: string) => {
+    let count = 0;
+    const rest = text.replace(/\[\[[^\[\]\n]+\]\]|\[[^\[\]\n]+\]\([^\s()\n]+\)/g, () => { count++; return ''; });
+    return count > 0 && /^[\s,;.&]*$/.test(rest);
+  };
+  const ranges: Array<[number, number]> = [];
+  let section: { valid: boolean; entries: Array<[number, number]> } | undefined;
+  const finishSection = () => {
+    if (section?.valid) ranges.push(...section.entries);
+    section = undefined;
+  };
+  let frontmatter = lines[0]?.text.trim() === '---';
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (frontmatter) {
+      if (i > 0 && /^(?:---|\.\.\.)\s*$/.test(line.text)) frontmatter = false;
+      continue;
+    }
+    if (!masked.slice(line.start, line.end).trim()) {
+      if (section && line.text.trim()) section.valid = false;
+      continue;
+    }
+    if (/^#{1,2}[ \t]/.test(line.text)) finishSection();
+    if (/^##[ \t]+(?:Attendees|Participants)[ \t]*\r?$/i.test(line.text)) {
+      section = { valid: true, entries: [] };
+      continue;
+    }
+    if (section) {
+      if (!line.text.trim()) continue;
+      if (/^(?: {4}|\t)/.test(line.text)
+        || !list(line.text.replace(/^[ \t]*[-*+][ \t]+/, ''))) section.valid = false;
+      section.entries.push([line.start, line.end]);
+      continue;
+    }
+    const inline = /^(?:(?:Attendees|Participants):|\*\*(?:Attendees|Participants):\*\*|\*\*(?:Attendees|Participants)\*\*:)[ \t]*(.*)$/i.exec(line.text);
+    if (inline && list(inline[1])) ranges.push([line.start, line.end]);
+  }
+  finishSection();
+  const admitted: Array<[number, number]> = [];
+  let commentIndex = 0;
+  for (const [start, end] of ranges) {
+    let cursor = start;
+    while (commentIndex < comments.length && comments[commentIndex][1] <= start) commentIndex++;
+    for (let i = commentIndex; i < comments.length && comments[i][0] < end; i++) {
+      if (comments[i][0] > cursor) admitted.push([cursor, comments[i][0]]);
+      cursor = Math.max(cursor, comments[i][1]);
+    }
+    if (cursor < end) admitted.push([cursor, end]);
+  }
+  return admitted;
+}
+
+export function hasAttendanceEvidence(ranges: ReadonlyArray<readonly [number, number]>, index: number): boolean {
+  let low = 0;
+  let high = ranges.length - 1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const [start, end] = ranges[middle];
+    if (index < start) high = middle - 1;
+    else if (index >= end) low = middle + 1;
+    else return true;
+  }
+  return false;
 }
 
 /**
@@ -653,6 +1153,17 @@ const FOUNDED_RE = /\b(?:founded|co-?founded|started the company|incorporated|fo
 //     "security advisor to|at", "product advisor to|at", "industry advisor".
 const ADVISES_RE = /\b(?:advises|advised|advisor (?:to|at|for|of)|advisory (?:board|role|position|capacity|engagement|partnership|contract|relationship|work)|board advisor|on .{0,20} advisory board|joined .{0,20} advisory board|in an? advisory (?:capacity|role|position)|as an? (?:advisor|security advisor|technical advisor|strategic advisor|industry advisor|product advisor|board advisor|senior advisor)|(?:strategic|technical|security|product|industry|senior|board) advisor (?:to|at|for|of)|consults for|consulting role (?:at|with))\b/i;
 
+// Chinese link type patterns for CJK entity mentions.
+// NOTE: These patterns are Chinese-only (zh). Japanese and Korean link
+// type extraction is not yet implemented. Entity NAME extraction in
+// by-mention.ts covers all three scripts (CJK = Chinese/Japanese/Korean)
+// via Unicode-aware tokenization.
+const ZH_FOUNDED_RE = /(?:创立|创办|成立|创建|建立|开创|发起)(?:了|的)/;
+const ZH_INVESTED_RE = /(?:投资|入股|融资|注资|参股)(?:了|的|了?于)/;
+const ZH_ADVISES_RE = /(?:顾问|咨询|指导)(?:了|的)?/;
+const ZH_WORKS_AT_RE = /(?:任职|就职|担任|供职|在.{0,10}(?:工作|上班|负责))(?:于|在|的)?/;
+const ZH_CITED_RE = /(?:引用|援引|提到|提及|转述|摘录)(?:了|的|自)?/;
+
 // Page-role detection: if the source page describes a partner/investor at
 // page level, that's a strong prior for outbound company refs being
 // invested_in even when per-edge context lacks explicit investment verbs.
@@ -676,6 +1187,49 @@ const ADVISOR_ROLE_RE = /\b(?:full-time advisor|professional advisor|advises (?:
 const EMPLOYEE_ROLE_RE = /\b(?:is an? (?:senior|staff|principal|lead|backend|frontend|full-?stack|ML|data|security|DevOps|platform)? ?engineer at|is an? (?:senior|staff|principal|lead)? ?(?:developer|designer|product manager|engineering manager|director|VP) (?:at|of)|holds? the (?:CTO|CEO|CFO|COO|CMO|CRO|VP) (?:role|position|seat|title) at|is the (?:CTO|CEO|CFO|COO|CMO|CRO) of|employee at|on the team at|works on .{0,30} at)\b/i;
 
 /**
+ * Content index ranges where the page-role prior must NOT apply: the
+ * machine-written list sections — Timeline, See also, Related, Facts,
+ * Sources, Links, Email mention links, Backlinks, Significant moments
+ * (headingRe below is the one source of truth). Links there are list-shaped, per-event references
+ * ("2026-05-12 — met with [[companies/x]]", Iron-Law back-links) — the
+ * role prior is a statement about the AUTHOR's standing relationships, not
+ * about every entity that passes through their timeline, so applying it
+ * there mints unevidenced works_at/advises edges on every re-import (on
+ * one 12k-page brain: ~7.4k such edges re-minted in a month, right after
+ * a ~19.5k cleanup; same class as #3466). Per-edge verbs inside these
+ * sections still type normally — only the globalContext fallback is
+ * suppressed, so absent explicit evidence the edge stays 'mentions'.
+ *
+ * A range runs from its heading to the next heading of the same or higher
+ * level (or EOF). Case-insensitive; matches "See also" / "See-also". Both
+ * grammars require the ATX space after the `#`s, so a column-0 tag line
+ * (`#links`) is neither an opener nor a closer.
+ */
+function rolePriorSuppressedRanges(content: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  const headingRe = /^(#{1,6})[ \t]+(?:timeline|see[ -]also|related|facts|sources|links|email mention links|backlinks|significant moments)\b[^\n]*$/gim;
+  const anyHeadingRe = /^(#{1,6})[ \t]/gm;
+  let m: RegExpExecArray | null;
+  while ((m = headingRe.exec(content)) !== null) {
+    const level = m[1].length;
+    anyHeadingRe.lastIndex = m.index + m[0].length;
+    // Deeper headings (`###` under `## Timeline`) stay inside the range; the
+    // first same-or-higher one closes it.
+    let next: RegExpExecArray | null;
+    while ((next = anyHeadingRe.exec(content)) !== null && next[1].length > level) { /* nested subsection */ }
+    ranges.push([m.index, next ? next.index : content.length]);
+  }
+  return ranges;
+}
+
+function inSuppressedRange(ranges: Array<[number, number]>, idx: number): boolean {
+  for (const [start, end] of ranges) {
+    if (idx >= start && idx < end) return true;
+  }
+  return false;
+}
+
+/**
  * Infer link_type from page context. Deterministic regex heuristics, no LLM.
  *
  * Two layers of inference:
@@ -691,7 +1245,7 @@ const EMPLOYEE_ROLE_RE = /\b(?:is an? (?:senior|staff|principal|lead|backend|fro
  * lists portfolio companies without repeating the investment verb each time
  * ("Her current board seats reflect her portfolio: [Co A], [Co B], [Co C]").
  */
-export function inferLinkType(pageType: PageType, context: string, globalContext?: string, targetSlug?: string): string {
+export function inferLinkType(pageType: PageType, context: string, globalContext?: string, targetSlug?: string, targetType?: string | null): string {
   if (pageType === 'media') {
     return 'mentions';
   }
@@ -700,12 +1254,21 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
   // path-proximity helper, not by markdown extraction — but the type is
   // declared here so graph-query knows the edge name.
   if ((pageType as string) === 'image') return 'image_of';
-  if ((pageType as string) === 'meeting') return 'attended';
+  if ((pageType as string) === 'meeting') {
+    return targetType !== undefined ? (targetType === 'person' ? 'attended' : 'mentions')
+      : (!targetSlug || targetSlug.startsWith('people/') ? 'attended' : 'mentions');
+  }
   // Per-edge verb rules.
   if (FOUNDED_RE.test(context)) return 'founded';
   if (INVESTED_RE.test(context)) return 'invested_in';
   if (ADVISES_RE.test(context)) return 'advises';
   if (WORKS_AT_RE.test(context)) return 'works_at';
+  // Chinese link type patterns
+  if (ZH_FOUNDED_RE.test(context)) return 'founded';
+  if (ZH_INVESTED_RE.test(context)) return 'invested_in';
+  if (ZH_ADVISES_RE.test(context)) return 'advises';
+  if (ZH_WORKS_AT_RE.test(context)) return 'works_at';
+  if (ZH_CITED_RE.test(context)) return 'cited';
   // Page-role prior: only fires for person -> company links. Concept pages
   // about VC topics naturally contain "venture capital" in their text, but
   // their company refs are mentions, not investments. Partner pages mentioning
@@ -798,14 +1361,25 @@ export const FRONTMATTER_LINK_MAP: FrontmatterFieldMapping[] = [
 
 // ─── Slug resolver ──────────────────────────────────────────────
 
+export interface ResolveOptions {
+  globalBasename?: boolean;
+  selfSlug?: string;
+}
+
 export interface SlugResolver {
+  resolveAttendance?(name: string, dirHint?: string | string[]): Promise<string | null>;
   /**
    * Resolve a display name to a canonical slug.
    * Returns null when no match meets confidence threshold — callers should
    * skip (not write a dead link) and the unresolved name goes into the
    * extract/put_page summary so the user can see the gap.
+   *
+   * `globalBasename` (#5749): the caller runs with
+   * `link_resolution.global_basename` on, so a unique page whose slug
+   * basename is `name` (other than `selfSlug`) resolves before any fuzzy or
+   * keyword-search candidate.
    */
-  resolve(name: string, dirHint?: string | string[]): Promise<string | null>;
+  resolve(name: string, dirHint?: string | string[], opts?: ResolveOptions): Promise<string | null>;
   /**
    * Issue #972: return every slug whose basename (final `/`-segment, or
    * the whole slug if it has no `/`) matches `name`. Multi-match by
@@ -822,18 +1396,30 @@ export interface SlugResolver {
 }
 
 /**
- * Issue #972 (codex [P2] DRY): the ONE basename matcher. Before this, three
- * surfaces (makeResolver, FS `resolveBasenameMatchesFromSlugs`, the doctor
- * `link_resolution_opportunity` check) each hand-rolled their own key set +
- * sort, and they drifted — the doctor omitted the slugified key, so its
- * "N would resolve" estimate undercounted what extraction actually produces.
- * All three now build/query through these two functions so they cannot drift.
+ * Issue #972 (codex [P2] DRY): the ONE basename matcher. makeResolver, the
+ * FS resolver, and the doctor `link_resolution_opportunity` check all
+ * build/query through these two functions so they cannot drift.
  *
- * Keying: raw tail + lowercase tail + slugified tail. A slug's tail is its
- * final `/`-segment (or the whole slug when it has no `/`).
+ * Keying: raw tail + lowercase tail + slugified tail (the final `/`-segment,
+ * or the whole slug when it has no `/`). #2367: slugified keys follow
+ * slugifySegment (NFD → strip accents → NFC → lowercase → SLUG_WORD_CHARS
+ * filter) and then fold stroke letters through latin-fold (#4855), so for
+ * names with đ/ø/ł/ß… the key is NOT byte-identical to the page slug sync
+ * mints; the dir-hint candidate step (makeResolver step 2, the FS resolver)
+ * tries both forms. The old ASCII-only strip emptied CJK basenames.
  */
+const BASENAME_KEEP_RE = new RegExp(`[^${SLUG_WORD_CHARS}\\s\\-]`, 'gu');
 export function normalizeBasename(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
+  // The accent strip cannot fold stroke letters \u2014 Unicode gives them no
+  // decomposition \u2014 so the shared table runs after it, on both the index and
+  // the query side. Without it a display name keeps the unfolded letter while
+  // the ASCII page slug does not, and the lookup misses in silence:
+  // `[[\u0110\u1ee9c Example]]` keyed `\u0111uc-example` and never found `people/duc-example`.
+  const folded = foldNonDecomposingLatin(
+    s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC')
+      .replace(SLUG_VARIATION_SELECTORS_RE, '').toLowerCase(), // twin of slugifySegment's strip (#4985)
+  );
+  return folded.replace(BASENAME_KEEP_RE, '').trim().replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
 }
 
 /** Stable order: shorter slug first (likely closer to brain root), then lexical. */
@@ -889,8 +1475,8 @@ export function makeResolver(
   opts: { mode: 'batch' | 'live'; sourceId?: string } = { mode: 'live' },
 ): SlugResolver {
   const cache = new Map<string, string | null>();
-
-  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
+  const attendanceCache = new Map<string, string | null>();
+  const attendanceCacheLimit = 256;
 
   // Issue #972: lazy-built basename → slug[] index for global-basename
   // resolution. Built on first call to `resolveBasenameMatches`; reused
@@ -926,50 +1512,125 @@ export function makeResolver(
   }
 
   return {
+    async resolveAttendance(name: string, dirHint?: string | string[]): Promise<string | null> {
+      let value = name.trim();
+      const colon = value.indexOf(':');
+      if (colon !== -1 && isValidSourceId(value.slice(0, colon))) {
+        if (value.slice(0, colon) !== (opts.sourceId ?? 'default')) return null;
+        value = value.slice(colon + 1);
+      }
+      const hints = Array.isArray(dirHint) ? dirHint : dirHint ? [dirHint] : [];
+      const cacheKey = JSON.stringify([opts.sourceId ?? 'default', value, hints]);
+      if (attendanceCache.has(cacheKey)) return attendanceCache.get(cacheKey)!;
+      const slugs = value.includes('/') ? [value] : [...new Set(hints.flatMap(hint =>
+        [normalizeBasename(value), slugifySegment(value)].map(form => `${hint}/${form}`)))];
+      const matches = await engine.executeRaw<{ slug: string }>(`SELECT slug FROM pages
+        WHERE source_id=$1 AND deleted_at IS NULL AND type='person'
+          AND (slug=ANY($2::text[]) OR lower(title)=lower($3)
+            OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(frontmatter->'aliases')='array'
+              THEN frontmatter->'aliases' ELSE '[]'::jsonb END) alias WHERE lower(alias)=lower($3))) LIMIT 2`,
+      [opts.sourceId ?? 'default', slugs, value]);
+      const resolved = matches.length === 1 ? matches[0].slug : null;
+      if (attendanceCache.size >= attendanceCacheLimit) attendanceCache.clear();
+      attendanceCache.set(cacheKey, resolved);
+      return resolved;
+    },
     async resolveBasenameMatches(name: string): Promise<string[]> {
       // Issue #972 (codex [P2] DRY): shared query so resolver + FS + doctor
       // return the same matches in the same stable order.
       return queryBasenameIndex(await ensureBasenameIndex(), name);
     },
 
-    async resolve(name: string, dirHint?: string | string[]): Promise<string | null> {
+    async resolve(name: string, dirHint?: string | string[], resolveOpts?: ResolveOptions): Promise<string | null> {
       if (!name || typeof name !== 'string') return null;
       const trimmed = name.trim();
       if (!trimmed) return null;
 
-      const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') : (dirHint || '')}`;
+      const basenameKey = resolveOpts?.globalBasename ? `\u0000basename:${resolveOpts.selfSlug ?? ''}` : '';
+      const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') : (dirHint || '')}${basenameKey}`;
       if (cache.has(cacheKey)) return cache.get(cacheKey)!;
 
       const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
 
-      // Step 1: already a slug? (dir/name shape, lowercase, hyphenated)
-      if (/^[a-z][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(trimmed)) {
-        const page = await engine.getPage(trimmed);
+      // Step 1: already a slug? Try an exact page lookup for any slug-shaped
+      // value (contains '/', slug charset). Broadened beyond the original
+      // single-segment lowercase-leading form (`^[a-z][a-z0-9-]*\/[a-z0-9]...`)
+      // to also accept digit-leading folders (`90-people/nicolai`,
+      // `01-trading/...`) and nested paths (`a/b/c`) — common in PARA-numbered
+      // vaults. This is an EXACT getPage match only — no fuzzy — so it never
+      // produces a false positive; a non-existent slug just falls through to
+      // the steps below. Fixes frontmatter `related: [[dir/slug]]` values
+      // (unwrapped by unwrapWikilink) that name a real page the strict regex
+      // could not reach and whose full-path fuzzy score is below threshold.
+      if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed)) {
+        // Same source scope as the basename index above (#972): a wikilink in
+        // source A must not resolve to a same-slug page in source B.
+        const page = await engine.getPage(trimmed, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
         if (page) {
           cache.set(cacheKey, trimmed);
           return trimmed;
         }
+        // A renamed page leaves `old -> new` in slug_aliases; links written
+        // against the old slug keep resolving to the page that moved.
+        if (typeof engine.resolveSlugWithAlias === 'function') {
+          const canonical = await engine.resolveSlugWithAlias(trimmed, opts.sourceId ?? 'default');
+          if (canonical !== trimmed && await engine.getPage(canonical, { sourceId: opts.sourceId ?? 'default' })) {
+            cache.set(cacheKey, canonical);
+            return canonical;
+          }
+        }
       }
 
-      // Step 2: dir-hint + slugify → exact getPage
-      const slugified = norm(trimmed);
+      // Step 2: dir-hint + slugify → exact getPage. Two grammars (#4855):
+      // normalizeBasename (#2367) folds stroke letters to ASCII via latin-fold,
+      // while slugifySegment — the page-slug grammar sync mints — keeps them
+      // (#3417), so a page synced from `Đức Example.md` lives at the unfolded
+      // slug. Exact lookups only, so trying both can never false-positive.
+      const forms = new Set([normalizeBasename(trimmed), slugifySegment(trimmed)]);
       for (const hint of hints) {
         if (!hint) continue;
-        const candidate = `${hint}/${slugified}`;
-        const page = await engine.getPage(candidate);
-        if (page) {
-          cache.set(cacheKey, candidate);
-          return candidate;
+        for (const form of forms) {
+          const candidate = `${hint}/${form}`;
+          const page = await engine.getPage(candidate, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
+          if (page) {
+            cache.set(cacheKey, candidate);
+            return candidate;
+          }
+        }
+      }
+
+      // Step 2.5 (#5749): with link_resolution.global_basename on, a unique
+      // page whose slug basename IS the name wins before fuzzy or keyword
+      // evidence about some other page — the exact-name-first precedence of
+      // resolveEntitySlug (#5769). Without it the live keyword step let a
+      // transcript that repeats the term take over a correct frontmatter edge.
+      if (resolveOpts?.globalBasename) {
+        const matches = queryBasenameIndex(await ensureBasenameIndex(), trimmed)
+          .filter(s => s !== resolveOpts.selfSlug);
+        if (matches.length === 1) {
+          cache.set(cacheKey, matches[0]);
+          return matches[0];
         }
       }
 
       // Step 3: pg_trgm fuzzy title match — both modes. Tries each hint in
       // order; first hint with a ≥0.55 similarity match wins. If no hints,
-      // try the whole pages table.
+      // try the whole pages table. When opts.sourceId is set, the fuzzy
+      // search is constrained to that source (and skips soft-deleted pages)
+      // so cross-source slug suggestions don't get silently dropped at the
+      // FK filter downstream. Mirrors the same scope fix `tryFuzzyMatch` got
+      // via #1436.
+      // A person, company, fund or organization candidate must carry the
+      // same name tokens (sameEntityName): a near-name like "Carol Exampl" never
+      // links to a different person's page and stays unresolved instead.
       const searchHints = hints.length > 0 ? hints : [undefined];
+      const confident = async (slug: string): Promise<boolean> => {
+        const page = await engine.getPage(slug, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only confidence check on a candidate the fuzzy lookup just returned
+        return !!page && (!isIdentityEntity(slug, page.type) || sameEntityName(trimmed, page.title, slug));
+      };
       for (const hint of searchHints) {
-        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55);
-        if (match) {
+        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55, opts.sourceId);
+        if (match && await confident(match.slug)) {
           cache.set(cacheKey, match.slug);
           return match.slug;
         }
@@ -980,13 +1641,13 @@ export function makeResolver(
       // mode skips this step entirely to keep migration deterministic.
       if (opts.mode === 'live') {
         try {
-          const results = await engine.searchKeyword(trimmed, { limit: 3 });
+          const results = await engine.searchKeyword(trimmed, { limit: 3, ...(opts.sourceId ? { sourceId: opts.sourceId } : {}) });
           if (results.length > 0 && results[0].score >= 0.8) {
             // Filter by dir hint if provided.
             const top = hints.length > 0
               ? results.find(r => hints.some(h => r.slug.startsWith(`${h}/`)))
               : results[0];
-            if (top) {
+            if (top && (!isIdentityEntity(top.slug, top.type) || sameEntityName(trimmed, top.title, top.slug))) {
               cache.set(cacheKey, top.slug);
               return top.slug;
             }
@@ -1003,16 +1664,37 @@ export function makeResolver(
 
 // ─── Frontmatter extractor ──────────────────────────────────────
 
+/**
+ * Unwrap an Obsidian `[[wikilink]]` frontmatter value to its bare link
+ * target so the resolver (which expects bare titles / dir slugs) can match
+ * it. Mainstream Obsidian authors frontmatter links as `related: ["[[Page]]"]`;
+ * without this, the resolver treats the brackets as part of the value and a
+ * `[[90-people/nicolai]]` is normalized into `90peoplenicolai`, so it never
+ * resolves. Strips a trailing `|alias`, `#heading`, or `^block` suffix — the
+ * link target only. The regex is anchored to a wholly-wrapped value
+ * (`^\s*\[\[…\]\]\s*$`), so bare titles and any value not fully wrapped pass
+ * through unchanged and existing behavior is preserved exactly.
+ */
+export function unwrapWikilink(value: string): string {
+  const match = /^\s*\[\[(.+?)\]\]\s*$/.exec(value);
+  if (!match) return value;
+  // Take the link target: drop |alias, then #heading / ^block suffixes.
+  const target = match[1].split('|')[0].split('#')[0].split('^')[0];
+  return target.trim();
+}
+
 export interface UnresolvedFrontmatterRef {
   /** The frontmatter field name. */
   field: string;
   /** The name that did not resolve. */
   name: string;
+  reason?: 'target_type_mismatch';
 }
 
 export interface FrontmatterExtractResult {
   candidates: LinkCandidate[];
   unresolved: UnresolvedFrontmatterRef[];
+  attendanceComplete: boolean;
 }
 
 /**
@@ -1028,11 +1710,41 @@ export async function extractFrontmatterLinks(
   pageType: PageType,
   frontmatter: Record<string, unknown>,
   resolver: SlugResolver,
+  globalBasename = false,
+  pack?: LinkExtractionPack | null,
+  targetType?: (slug: string) => string | undefined,
+  onResolvedTarget?: (slug: string) => void,
 ): Promise<FrontmatterExtractResult> {
   const candidates: LinkCandidate[] = [];
   const unresolved: UnresolvedFrontmatterRef[] = [];
+  let attendanceComplete = true;
 
-  for (const mapping of FRONTMATTER_LINK_MAP) {
+  const packMappings: FrontmatterFieldMapping[] = [];
+  if (pack && pack.frontmatter_links.length > 0) {
+    const seenFields = new Set<string>();
+    for (const fl of pack.frontmatter_links) {
+      for (const field of fl.fields) {
+        if (seenFields.has(field)) continue;
+        seenFields.add(field);
+        const type = frontmatterLinkTypeFromPack(pack, pageType as string, field);
+        if (!type) continue; // no pack rule for this page type
+        const expectedType = pack.link_types.find(lt => lt.name === type)?.inference?.target_type;
+        const prefixes = pack.page_types?.find(pt => pt.name === expectedType)?.path_prefixes.map(p => p.replace(/^\/+|\/+$/g, ''));
+        const legacy = FRONTMATTER_LINK_MAP.find(mapping => mapping.fields.includes(field)
+          && (!mapping.pageType || mapping.pageType === pageType));
+        const declared = FRONTMATTER_LINK_MAP.find(mapping => mapping.type === type
+          && (!mapping.pageType || mapping.pageType === pageType));
+        packMappings.push({ fields: [field], type, direction: declared?.direction ?? 'outgoing',
+          dirHint: prefixes?.length ? prefixes : legacy?.dirHint ?? '' });
+      }
+    }
+  }
+
+  const overriddenFields = new Set(packMappings.flatMap(mapping => mapping.fields));
+  const legacyMappings = FRONTMATTER_LINK_MAP.map(mapping => ({
+    ...mapping, fields: mapping.fields.filter(field => !overriddenFields.has(field)),
+  }));
+  for (const mapping of [...legacyMappings, ...packMappings]) {
     if (mapping.pageType && mapping.pageType !== pageType) continue;
     for (const field of mapping.fields) {
       const value = frontmatter[field];
@@ -1060,9 +1772,43 @@ export async function extractFrontmatterLinks(
         }
         if (!name) continue;   // skip numbers, nulls, malformed objects
 
-        const resolved = await resolver.resolve(name, mapping.dirHint);
+        // Accept Obsidian `[[wikilink]]` values in frontmatter link fields by
+        // unwrapping to the bare target before resolution. Bare titles pass
+        // through unchanged; the original `name` is preserved for the
+        // unresolved report and edge context.
+        const linkTarget = unwrapWikilink(name);
+        const canonicalAttendance = mapping.type === 'attended' && mapping.direction === 'incoming';
+        let resolved = await (canonicalAttendance && resolver.resolveAttendance
+          ? resolver.resolveAttendance(linkTarget, mapping.dirHint)
+          : resolver.resolve(linkTarget, mapping.dirHint, globalBasename ? { globalBasename, selfSlug: slug } : undefined));
+        if (!resolved && globalBasename && !(canonicalAttendance && resolver.resolveAttendance)
+          && typeof resolver.resolveBasenameMatches === 'function') {
+          // Issue #972 follow-up: extend global_basename resolution to
+          // frontmatter link fields. resolve() can't reach a bare-title
+          // wikilink value (e.g. `sources: "[[2025-12-25_mentor-extraction]]"`)
+          // — it has no '/', so the slug-direct getPage is skipped, and the
+          // field's dirHint may name folders that don't exist in this brain,
+          // so the dir-scoped exact + fuzzy steps miss too. When
+          // link_resolution.global_basename is on, fall back to the SAME
+          // basename index the body bare-wikilink pass uses. Unique-match-only:
+          // ambiguous basenames (e.g. archive duplicates, generic hubs like
+          // `_index`) stay unresolved rather than create a wrong edge.
+          const matches = (await resolver.resolveBasenameMatches(linkTarget))
+            .filter((s) => s !== slug);
+          if (matches.length === 1) resolved = matches[0];
+        }
         if (!resolved) {
+          if (mapping.type === 'attended') attendanceComplete = false;
           unresolved.push({ field, name });
+          continue;
+        }
+        onResolvedTarget?.(resolved);
+        const packTargetType = packMappings.includes(mapping)
+          ? pack?.link_types.find(lt => lt.name === mapping.type)?.inference?.target_type : undefined;
+        const expectedType = canonicalAttendance ? 'person' : packTargetType;
+        if (expectedType && (targetType || packTargetType) && targetType?.(resolved) !== expectedType) {
+          if (targetType?.(resolved) === undefined && mapping.type === 'attended') attendanceComplete = false;
+          unresolved.push({ field, name, reason: 'target_type_mismatch' });
           continue;
         }
 
@@ -1086,7 +1832,7 @@ export async function extractFrontmatterLinks(
     }
   }
 
-  return { candidates, unresolved };
+  return { candidates, unresolved, attendanceComplete };
 }
 
 // ─── Timeline parsing ───────────────────────────────────────────
@@ -1098,11 +1844,62 @@ export interface TimelineCandidate {
   summary: string;
   /** Optional detail (subsequent lines until next entry/heading). */
   detail: string;
+  /**
+   * #3957: source label. Pipe-separated bullets split `Source — Summary`
+   * (via findTimelineSourceDelimiter, the SAME split the FS extractor in
+   * timeline-extract.ts applies), inline citations carry their `[Source: X]`
+   * label, everything else defaults to 'markdown'. Pre-fix the DB path left
+   * this unset, so callers wrote source='' while the FS path wrote the split
+   * label + trimmed summary — the (page_id, date, summary, source) dedup
+   * index saw two shapes for the same bullet and every FS-then-DB (or
+   * DB-then-FS) re-extraction duplicated the row.
+   */
+  source?: string;
+}
+
+/**
+ * #3957 (moved from timeline-extract.ts so BOTH parsers share it): index of
+ * the first dash (—, –, -) that can serve as the `Source — Summary`
+ * delimiter: it must have whitespace on both sides and sit outside every
+ * markdown-link span. Hyphens inside link targets
+ * (`../people/alice-example.md`) and dashes inside link labels
+ * (`[Deals — Q1 Review](...)`) are content, not delimiters — splitting on
+ * them shatters one entry into two fragments whose halves re-insert on
+ * every sync (the (page_id, date, summary, source) uniqueness sees each
+ * fragment shape as a new row). Returns -1 when the line has no delimiter.
+ */
+export function findTimelineSourceDelimiter(text: string): number {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '[' || c === '(') depth++;
+    else if (c === ']' || c === ')') { if (depth > 0) depth--; }
+    else if (
+      depth === 0 &&
+      (c === '—' || c === '–' || c === '-') &&
+      i > 0 && /\s/.test(text[i - 1]) &&
+      i + 1 < text.length && /\s/.test(text[i + 1])
+    ) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 // Match: `- **YYYY-MM-DD** | summary` or `- **YYYY-MM-DD** -- summary`
 // or `- **YYYY-MM-DD** - summary` or just `**YYYY-MM-DD** | summary`.
-const TIMELINE_LINE_RE = /^\s*-?\s*\*\*(\d{4}-\d{2}-\d{2})\*\*\s*[|\-–—]+\s*(.+?)\s*$/;
+// #3957: the separator run is captured so the parser can apply the
+// `Source — Summary` split ONLY to pipe-separated bullets (the canonical
+// shape the FS extractor matches); a dash-separated bullet's rest is one
+// summary and must not be shattered on its first interior dash.
+const TIMELINE_LINE_RE = /^\s*(?:-\s*)?\*\*(\d{4}-\d{2}-\d{2})\*\*\s*([|\-–—]+)\s*(.+?)\s*$/;
+// Chinese date lines: `- 2020年1月2日 | summary` (bold optional). Requires the
+// 年/月 markers so plain ASCII `- 2020-01-02 - text` does NOT match — non-bold
+// ASCII dates were never timeline entries and must stay that way.
+const TIMELINE_LINE_RE_CN = /^\s*(?:-\s*)?(?:\*\*)?(\d{4})年(\d{1,2})月(\d{1,2})日?(?:\*\*)?\s*([|\-–—]+)\s*(.+?)\s*$/;
+
+// `### YYYY-MM-DD — summary` headings, as the FS extractor (timeline-extract.ts Format 2) accepts.
+const TIMELINE_HEADING_RE = /^\s*###\s+(\d{4}-\d{2}-\d{2})\s*[\-–—]+\s*(.+?)\s*$/;
 
 /**
  * Parse timeline entries from content. Looks at:
@@ -1119,25 +1916,63 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
 
   let i = 0;
   while (i < lines.length) {
-    const m = TIMELINE_LINE_RE.exec(lines[i]);
-    if (!m) {
-      i++;
-      continue;
-    }
-    const date = m[1];
-    const summary = m[2].trim();
-    if (!isValidDate(date) || summary.length === 0) {
-      i++;
-      continue;
+    const headingMatch = TIMELINE_HEADING_RE.exec(lines[i]);
+    const isHeadingEntry = headingMatch !== null;
+    let date: string;
+    let summary: string;
+    let separator = '';
+
+    if (headingMatch) {
+      date = headingMatch[1];
+      summary = headingMatch[2].trim();
+    } else {
+      // Try English bullet format first, then Chinese.
+      const lineMatch = TIMELINE_LINE_RE.exec(lines[i]);
+      if (lineMatch) {
+        date = lineMatch[1];
+        separator = lineMatch[2];
+        summary = lineMatch[3].trim();
+      } else {
+        const chineseMatch = TIMELINE_LINE_RE_CN.exec(lines[i]);
+        if (!chineseMatch) { i++; continue; }
+        // Normalize Chinese date to YYYY-MM-DD.
+        date = `${chineseMatch[1]}-${chineseMatch[2].padStart(2, '0')}-${chineseMatch[3].padStart(2, '0')}`;
+        separator = chineseMatch[4];
+        summary = chineseMatch[5].trim();
+      }
     }
 
+    if (!isValidDate(date) || summary.length === 0) { i++; continue; }
+    // #4277: backlink materialization historically wrote dated navigation
+    // receipts such as `- **2026-06-13** | Referenced in [Acme](../companies/acme.md)`.
+    // The date belongs to the backlink write, not to an event involving this
+    // entity — treating it as timeline evidence both invents event dates and
+    // lets graph-maintenance noise satisfy timeline coverage. Guard on the
+    // PRE-split rest (must START with the marker) so a write-through rendered
+    // `source — summary` bullet whose summary merely mentions the phrase is
+    // untouched. Mirrored in extractTimelineFromContent (timeline-extract.ts)
+    // so FS- and DB-side extraction stay in lockstep.
+    if (/^Referenced in\s+\[/i.test(summary)) { i++; continue; }
+    // #3957: pipe-separated bullets carry the canonical `Source — Summary`
+    // shape; split them exactly like the FS extractor (extractTimelineFromContent
+    // Format 1) so FS- and DB-extracted rows share one (source, summary) shape
+    // and the DB dedup index collapses re-extractions instead of duplicating.
+    // Dash-separated bullets and dated headings are one summary — no split.
+    let source = 'markdown';
+    if (separator.includes('|')) {
+      const at = findTimelineSourceDelimiter(summary);
+      if (at >= 0) {
+        source = summary.slice(0, at).trim();
+        summary = summary.slice(at + 1).trim();
+      }
+    }
     // Collect optional detail lines (indented, until next date or heading).
     const detailLines: string[] = [];
     let j = i + 1;
     while (j < lines.length) {
       const next = lines[j];
-      if (TIMELINE_LINE_RE.test(next)) break;
-      if (/^#{1,6}\s/.test(next)) break;
+      if (TIMELINE_LINE_RE.test(next) || TIMELINE_HEADING_RE.test(next)) break;
+      if (/^#{1,6}\s/.test(next) || isMaterializedMarkerLine(next)) break; // #5567: a marker opens the next bullet
       if (next.trim().length === 0 && detailLines.length === 0) {
         // skip leading blank line; if we hit a blank after detail content
         // and still no new entry, treat detail as ended.
@@ -1145,16 +1980,31 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
         continue;
       }
       if (next.trim().length === 0 && detailLines.length > 0) break;
-      // Indented continuation lines are detail; flush-left non-list lines too.
-      if (/^\s+/.test(next) || (!next.startsWith('-') && !next.startsWith('*') && !next.startsWith('#'))) {
+      if (isHeadingEntry || /^\s+/.test(next) || (!next.startsWith('-') && !next.startsWith('*') && !next.startsWith('#'))) {
         detailLines.push(next.trim());
         j++;
         continue;
       }
       break;
     }
-    result.push({ date, summary, detail: detailLines.join(' ').trim() });
+    result.push({ date, summary, detail: detailLines.join(' ').trim(), source });
     i = j;
+  }
+
+  // Format 3: inline citation — [Source: <source>, YYYY-MM-DD]. The citation
+  // convention gbrain's own quality rules require on every brain write;
+  // until now this parser (the db-source extract + ingest path) could not
+  // see it, so a page whose dates all live in citations scored zero
+  // timeline coverage. Kept in sync with extractTimelineFromContent's
+  // Format 3 (the fs-source path). Blocks already captured by the timeline
+  // bullet pass are skipped (a bullet often carries its own citation).
+  for (const entry of parseInlineCitationTimelineEntries(content, {
+    skipLine: (line) => TIMELINE_LINE_RE.test(line) || TIMELINE_LINE_RE_CN.test(line),
+  })) {
+    // #3957: carry the citation's source label in `source` (the dedup-key
+    // column) so the row shape matches the FS extractor's Format 3; the
+    // human-readable detail is kept for existing consumers.
+    result.push({ date: entry.date, summary: entry.summary, detail: `Source: ${entry.source}`, source: entry.source });
   }
   return result;
 }
@@ -1166,8 +2016,48 @@ function isValidDate(s: string): boolean {
   if (mo < 1 || mo > 12) return false;
   if (d < 1 || d > 31) return false;
   // Use Date object as final check (catches 2026-02-30 etc.)
-  const dt = new Date(Date.UTC(y, mo - 1, d));
+  const dt = new Date(new Date(0).setUTCFullYear(y, mo - 1, d)); // not Date.UTC: it maps years 0-99 to 1900-1999
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
+/** Input for {@link deriveTimelineAnchor}: a page's identity + its computed content date. */
+export interface TimelineAnchorInput {
+  slug: string;
+  title?: string | null;
+  effectiveDate?: Date | string | null;
+  effectiveDateSource?: EffectiveDateSource | null;
+}
+
+/**
+ * Anchor a single timeline entry from a page's computed content date, for pages
+ * whose body carries no parseable timeline line.
+ *
+ * Comms- and calendar-dominated brains keep the date in frontmatter or the
+ * filename (slug `2026-04-24-...`), not in the prose, so `parseTimelineEntries`
+ * returns nothing and the page-level `timeline` table stays empty even though
+ * the page is firmly dated — leaving `get_timeline` and the brain-score
+ * `timeline_coverage` component blind to it. This recovers that signal from the
+ * already-computed `effective_date` (no re-parsing). (It does NOT feed the
+ * facts-based `find_trajectory`, which reads the `facts` table by entity_slug.)
+ *
+ * Fires ONLY for a trustworthy content date — frontmatter (`event_date` / `date`
+ * / `published`) or the `filename` date — never the `fallback` source, which is
+ * `updated_at` (link-churn noise, not when the thing happened). Returns null
+ * when no trustworthy date is available. Callers MUST apply this only when body
+ * parsing yields zero entries, so it can never shadow a real in-body timeline.
+ */
+export function deriveTimelineAnchor(input: TimelineAnchorInput): TimelineCandidate | null {
+  const { slug, title, effectiveDate, effectiveDateSource } = input;
+  if (!effectiveDate) return null;
+  // 'fallback' === updated_at; the rest ('event_date'|'date'|'published'|'filename')
+  // are real content dates. null/undefined source is not trustworthy either.
+  if (effectiveDateSource == null || effectiveDateSource === 'fallback') return null;
+  const dt = typeof effectiveDate === 'string' ? new Date(effectiveDate) : effectiveDate;
+  if (!(dt instanceof Date) || Number.isNaN(dt.getTime())) return null;
+  const iso = dt.toISOString().slice(0, 10);
+  if (!isValidDate(iso)) return null;
+  const summary = (title ?? '').trim() || slug.split('/').pop() || slug;
+  return { date: iso, summary, detail: '' };
 }
 
 // ─── Auto-link config ───────────────────────────────────────────
@@ -1223,6 +2113,45 @@ export async function isGlobalBasenameEnabled(engine: BrainEngine): Promise<bool
     return ['1', 'true', 'yes', 'on'].includes(normalized);
   }
   const val = await engine.getConfig('link_resolution.global_basename');
+  if (val == null) return false;
+  const normalized = val.trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+}
+
+/**
+ * Read the `link_resolution.cross_source` config flag. Defaults to FALSE
+ * (opt-in only; the historical same-source-or-'default' edge gate is
+ * preserved for existing brains).
+ *
+ * When TRUE: a wikilink whose target slug exists ONLY in other sources
+ * (neither the origin page's source nor 'default') still produces an edge,
+ * with `to_source_id` picked deterministically (lexicographically smallest
+ * matching source). When FALSE, those candidates are dropped — but counted
+ * and surfaced in the extract summary, never silent (issue #2589: the drop
+ * was previously indistinguishable from an unresolved link).
+ *
+ * SCOPE: the DB extract paths (`extract links --source db`, `extract --stale`),
+ * the mention scan (`findMentionedEntities` callers lift their guard under it),
+ * and the serve-resident maintenance sweep (`sweep.ts`, #3757 — it threads the
+ * same flag so its reconcile keeps the edges the CLI lanes created).
+ * The FS-walk paths (dir-driven, incl. the autopilot cycle's extract phase)
+ * build their slug set from the walked files of ONE source, so cross-source
+ * targets aren't resolvable there; FS-walk parity is a filed follow-up.
+ *
+ * Resolution order (highest → lowest):
+ *   1. Env var `GBRAIN_LINK_RESOLUTION_CROSS_SOURCE=1` (operator override)
+ *   2. DB plane via `engine.getConfig('link_resolution.cross_source')`
+ *   3. Default false
+ *
+ * Closes https://github.com/garrytan/gbrain/issues/2589.
+ */
+export async function isCrossSourceLinksEnabled(engine: BrainEngine): Promise<boolean> {
+  const envVal = process.env.GBRAIN_LINK_RESOLUTION_CROSS_SOURCE;
+  if (envVal != null) {
+    const normalized = envVal.trim().toLowerCase();
+    return ['1', 'true', 'yes', 'on'].includes(normalized);
+  }
+  const val = await engine.getConfig('link_resolution.cross_source');
   if (val == null) return false;
   const normalized = val.trim().toLowerCase();
   return ['1', 'true', 'yes', 'on'].includes(normalized);

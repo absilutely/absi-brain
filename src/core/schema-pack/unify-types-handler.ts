@@ -37,6 +37,8 @@ import { runStatsCore } from './stats.ts';
 import { runSyncCore } from './sync.ts';
 import { tryAcquireDbLock, type DbLockHandle } from '../db-lock.ts';
 import type { PackMappingRule } from './manifest-v1.ts';
+import { OperationError } from '../ops/contract.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 
 export interface UnifyTypesInput {
   /** The pack name to upgrade TO (e.g. 'gbrain-base-v2'). */
@@ -69,6 +71,21 @@ export interface UnifyTypesResult {
 }
 
 /**
+ * #5634: the retype, link and alias phases write canonical tables outside the
+ * persistence coordinator, which a managed brain refuses mid-run. Apply is
+ * refused before the lock or any write; the dry run still previews.
+ */
+async function managedApplyWarnings(ctx: OperationContext, targetPack: string, apply: boolean): Promise<string[]> {
+  if (!await managedPersistenceEnabled(ctx.engine)) return [];
+  if (apply) {
+    throw new OperationError('writer_coordinator_required',
+      'unify-types apply is not supported on a managed brain: its retype runs outside the persistence coordinator. No page was changed.',
+      `Preview the plan with gbrain jobs submit unify-types --params '${JSON.stringify({ target_pack: targetPack })}'. Coordinated retype is not available yet.`);
+  }
+  return ['unify-types apply is not supported on a managed brain; this dry run is a preview only.'];
+}
+
+/**
  * Pure orchestrator for the unify-types handler. Engine is supplied via
  * OperationContext. Caller (jobs.ts wrapper) wires engine + onProgress.
  *
@@ -83,7 +100,7 @@ export async function runUnifyTypes(
   const apply = input.apply === true;
   const sourceId = input.sourceId;
   const onProgress = input.onProgress ?? (() => {});
-  const warnings: string[] = [];
+  const warnings = await managedApplyWarnings(ctx, input.target_pack, apply);
 
   onProgress(`[unify-types] starting (apply=${apply}, target_pack=${input.target_pack})`);
 
@@ -131,7 +148,13 @@ export async function runUnifyTypes(
   try {
     // Partition mapping_rules by kind
     const explicitRetypeRules: RetypeRule[] = [];
-    let catchAllRule: { to_type: string; subtype?: string; subtype_field?: string } | null = null;
+    let catchAllRule: {
+      to_type: string;
+      subtype?: string;
+      subtype_field?: string;
+      path_filter?: string;
+      slug_filter?: string;
+    } | null = null;
     const pageToLinkRules: PageToLinkRule[] = [];
     const pageToAliasRules: PageToAliasRule[] = [];
     for (const rule of targetPack.manifest.mapping_rules as PackMappingRule[]) {
@@ -144,6 +167,12 @@ export async function runUnifyTypes(
             to_type: rule.to_type,
             subtype: rule.subtype,
             subtype_field: rule.subtype_field,
+            // #4651: carry the disambiguation filters through — dropping
+            // them silently widened the catch-all's selection to every page
+            // of an unknown type (the explicit-rule path below always
+            // copied them).
+            path_filter: rule.path_filter,
+            slug_filter: rule.slug_filter,
           };
         } else {
           explicitRetypeRules.push({
@@ -152,6 +181,7 @@ export async function runUnifyTypes(
             subtype: rule.subtype,
             subtype_field: rule.subtype_field,
             path_filter: rule.path_filter,
+            slug_filter: rule.slug_filter,
           });
         }
       } else if (rule.kind === 'page_to_link') {
@@ -222,6 +252,10 @@ export async function runUnifyTypes(
           subtype: catchAllRule!.subtype === ORIGINAL_TYPE_SENTINEL
             ? ut
             : catchAllRule!.subtype,
+          // #4651: runRetypeCore honors both filters for explicit rules;
+          // synthesized catch-all rules must respect the same boundaries.
+          path_filter: catchAllRule!.path_filter,
+          slug_filter: catchAllRule!.slug_filter,
         }));
         const result = await runRetypeCore(ctx, { rules: synthesized, apply, sourceId });
         retypeCatchAll = {

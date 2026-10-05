@@ -1,3 +1,4 @@
+import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-guard.ts';
 // `gbrain schema` CLI surface.
 //
 // The active schema pack drives type inference, link verbs, expert
@@ -19,18 +20,22 @@
 
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { parseArgs } from 'node:util';
 import {
   addAliasToType,
   addLinkTypeToPack,
   addPrefixToType,
+  BUNDLED_PACK_NAMES,
   addTypeToPack,
   invalidatePackCache,
   loadActivePack,
+  loadResolvedPackByName,
   removeAliasFromType,
   removeLinkTypeFromPack,
   removePrefixFromType,
   removeTypeFromPack,
   resolveActivePackNameOnly,
+  resolveLoadedPack,
   loadPackFromFile,
   parseSchemaPackManifest,
   runStatsCore,
@@ -47,7 +52,12 @@ import {
 } from '../core/schema-pack/index.ts';
 import type { SchemaPackManifest, PackPrimitive } from '../core/schema-pack/manifest-v1.ts';
 import { PACK_PRIMITIVES } from '../core/schema-pack/manifest-v1.ts';
-import { gbrainPath, loadConfig, configPath } from '../core/config.ts';
+import { bundledPackPath } from '../core/schema-pack/bundled-assets.ts';
+import { gbrainPath, loadConfig, configPath, toEngineConfig, isThinClient, type GBrainConfig } from '../core/config.ts';
+import { opError } from '../core/ops/contract.ts';
+import { readDbSchemaPack } from '../core/schema-pack/best-effort.ts';
+import { sanitizeTypeForDisplay } from '../core/schema-pack/type-usage.ts';
+import { yamlScalar } from '../core/frontmatter-inference.ts';
 
 export async function runSchema(args: string[]): Promise<void> {
   const sub = args[0];
@@ -71,6 +81,7 @@ export async function runSchema(args: string[]): Promise<void> {
     case 'downgrade': return runDowngradeCmd(args.slice(1));
     case 'usage':    return runUsageCmd(args.slice(1));
     case 'stats':    return runStatsCmd(args.slice(1));
+    case 'cardinality-preview': return runCardinalityPreviewCmd(args.slice(1));
     case 'sync':     return runSyncCmd(args.slice(1));
     case 'reload':   return runReloadCmd(args.slice(1));
     case 'add-type': return runAddTypeCmd(args.slice(1));
@@ -107,6 +118,8 @@ Inspection:
   graph                   Show type/primitive graph with link-verb edges
   lint [<pack>]           Lint a pack for duplicates, dangling refs, etc.
   stats [--source <id>]   Per-type page counts + typed-coverage from the DB
+  cardinality-preview [--source <id>]
+                          Pages with several live relationships of a declared single-value type, and what the dream cycle closes (read-only)
   explain <type>          Print resolved settings for a single type
   usage [--since N(d|w|m)] CLI invocation telemetry summary
 
@@ -163,10 +176,30 @@ Resolution chain (7-tier, tier 1 trust-gated):
 `);
 }
 
+/**
+ * DB-plane `schema_pack` (tier 4) for the read-only inspection verbs
+ * (active / show / graph / lint / explain), so they all report the SAME pack
+ * the engine queries with on brains whose active pack was flipped via
+ * `gbrain config set schema_pack` / unify-types (#3792, #4653). Best-effort
+ * AND gated on an actually-configured brain (cfg non-null): an unconfigured
+ * home has no DB plane to consult, and connecting would cold-CREATE a PGLite
+ * data dir as a side effect of a read-only command. No connectable DB →
+ * undefined, so file/env resolution stands.
+ */
+async function readDbSchemaPackConfig(cfg: GBrainConfig | null): Promise<string | undefined> {
+  if (!cfg) return undefined;
+  try {
+    return await withConnectedEngine((engine) => readDbSchemaPack(engine));
+  } catch {
+    return undefined;
+  }
+}
+
 async function runActive(_args: string[]): Promise<void> {
   const cfg = loadConfig();
-  const resolution = resolveActivePackNameOnly({ cfg, remote: false });
-  const pack = await loadActivePack({ cfg, remote: false });
+  const dbConfig = await readDbSchemaPackConfig(cfg);
+  const resolution = resolveActivePackNameOnly({ cfg, remote: false, dbConfig });
+  const pack = await loadActivePack({ cfg, remote: false, dbConfig });
   console.log(`Active pack: ${pack.manifest.name} v${pack.manifest.version}`);
   console.log(`Source: ${resolution.source}`);
   console.log(`Pack identity: ${pack.identity}`);
@@ -179,7 +212,7 @@ async function runActive(_args: string[]): Promise<void> {
 }
 
 function runList(_args: string[]): void {
-  const bundled = ['gbrain-base', 'gbrain-recommended'];
+  const bundled = [...BUNDLED_PACK_NAMES];
   const installedDir = gbrainPath('schema-packs');
   const installed: string[] = [];
   if (existsSync(installedDir)) {
@@ -225,7 +258,8 @@ async function runShow(args: string[]): Promise<void> {
     }
     manifest = loadPackFromFile(path);
   } else {
-    const pack = await loadActivePack({ cfg: loadConfig(), remote: false });
+    const cfg = loadConfig();
+    const pack = await loadActivePack({ cfg, remote: false, dbConfig: await readDbSchemaPackConfig(cfg) });
     manifest = pack.manifest;
   }
   if (asFilingRules) {
@@ -366,12 +400,17 @@ function runUse(args: string[]): void {
 }
 
 function packPathByName(name: string): string | null {
-  if (name === 'gbrain-base') {
-    // Resolve bundled YAML — try a few locations.
+  if (BUNDLED_PACK_NAMES.has(name)) {
+    // Statically bundled asset path [ENG-6] (#4266): resolves in dev AND
+    // inside `bun build --compile` binaries, where the import.meta-relative
+    // candidates below don't exist.
+    const asset = bundledPackPath(name);
+    if (asset) return asset;
+    // Resolve bundled YAML — import.meta fallback, try a few locations.
     const here = dirname(new URL(import.meta.url).pathname);
     const candidates = [
-      join(here, '..', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
-      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
+      join(here, '..', 'core', 'schema-pack', 'base', `${name}.yaml`),
+      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', `${name}.yaml`),
     ];
     for (const c of candidates) {
       if (existsSync(c)) return c;
@@ -433,16 +472,19 @@ function parseFlags(args: string[]): ParsedFlags {
 
 async function withConnectedEngine<T>(fn: (engine: import('../core/engine.ts').BrainEngine) => Promise<T>): Promise<T> {
   const { createEngine } = await import('../core/engine-factory.ts');
-  const cfg = loadConfig() ?? {};
-  const engineKind = (cfg as { engine?: string }).engine === 'postgres' ? 'postgres' : 'pglite';
+  const cfg: GBrainConfig = loadConfig() ?? { engine: 'pglite' };
+  // A thin client has no local database: refuse rather than die with "No
+  // database URL" or read an empty in-memory PGLite (#5102).
+  if (isThinClient(cfg) && !cfg.database_url) {
+    throw opError('requires_local_engine',
+      'This `gbrain schema` subcommand reads the brain database, which lives on the brain host; it is not routable from a thin client.',
+      'Use the matching schema_* MCP tool (e.g. `schema_stats`) from your agent, or run it on the brain host.');
+  }
   // PR #1321 (closed) defensive fix retained: build the EngineConfig once and
   // pass it to BOTH createEngine and engine.connect. The factory captures
   // config at construction; explicit re-pass at connect() is defense in depth
   // against future engine implementations that read URL from connect-time.
-  const connectConfig: import('../core/types.ts').EngineConfig = {
-    engine: engineKind,
-    database_url: (cfg as { database_url?: string }).database_url,
-  };
+  const connectConfig = toEngineConfig(cfg);
   const engine = await createEngine(connectConfig);
   await engine.connect(connectConfig);
   try {
@@ -546,6 +588,7 @@ async function runInitCmd(args: string[]): Promise<void> {
     console.error(`Pack \`${name}\` already exists at ${baseDir}`);
     process.exit(1);
   }
+  assertManagedFilesystemWrite(baseDir);
   mkdirSync(baseDir, { recursive: true });
   // Cast through Partial — the validate verb is the authoritative shape check.
   // The YAML written below has the minimum fields; lint/validate catch gaps.
@@ -566,7 +609,7 @@ async function runInitCmd(args: string[]): Promise<void> {
   };
   const yaml = `# Stub pack — extends gbrain-base by default. Add your own page_types below.
 api_version: ${stub.api_version}
-name: ${stub.name}
+name: ${yamlScalar(stub.name)}
 version: ${stub.version}
 gbrain_min_version: ${stub.gbrain_min_version}
 extends: gbrain-base
@@ -608,6 +651,7 @@ async function runForkCmd(args: string[]): Promise<void> {
     console.error(`Pack \`${to}\` already exists at ${toDir}`);
     process.exit(1);
   }
+  assertManagedFilesystemWrite(toDir);
   mkdirSync(toDir, { recursive: true });
   const sourceManifest = loadPackFromFile(fromPath);
   const forked = { ...sourceManifest, name: to, version: '0.0.1' };
@@ -680,7 +724,7 @@ async function runDiffCmd(args: string[]): Promise<void> {
 async function runGraphCmd(args: string[]): Promise<void> {
   const { json } = parseFlags(args);
   const cfg = loadConfig();
-  const pack = await loadActivePack({ cfg, remote: false });
+  const pack = await loadActivePack({ cfg, remote: false, dbConfig: await readDbSchemaPackConfig(cfg) });
   if (json) {
     console.log(JSON.stringify({
       schema_version: 1,
@@ -700,28 +744,59 @@ async function runGraphCmd(args: string[]): Promise<void> {
 
 async function runLintCmd(args: string[]): Promise<void> {
   const { json, positional } = parseFlags(args);
-  const withDb = args.includes('--with-db');
-  const name = positional[0];
+  const { values: { 'with-db': withDb }, positionals } = parseArgs({
+    args: positional,
+    allowPositionals: true,
+    options: {
+      'with-db': { type: 'boolean' },
+    },
+  });
+  if (positionals.length > 1) {
+    console.error('Usage: gbrain schema lint [<pack>] [--with-db] [--json]');
+    process.exit(2);
+  }
+  const name = positionals[0];
   const cfg = loadConfig();
-  let pack: SchemaPackManifest | null;
-  if (name) {
-    const p = packPathByName(name);
-    try { pack = p ? loadPackFromFile(p) : null; } catch { pack = null; }
-  } else {
-    pack = (await loadActivePack({ cfg, remote: false })).manifest;
-  }
-  if (!pack) {
-    console.error(`Pack not found: ${name}`);
-    process.exit(1);
-  }
   // v0.40.6.0 Phase 5: swap basic 2-rule check for the rich 11-rule lint
   // suite from Phase 1.5. File-plane rules run by default; --with-db
   // opts into extractable_empty_corpus + mutation_count_anomaly which
   // need an engine connection.
   const { runAllLintRules } = await import('../core/schema-pack/lint-rules.ts');
-  const report = withDb
-    ? await withConnectedEngine(async (engine) => runAllLintRules(pack!, { engine }))
-    : await runAllLintRules(pack);
+  // Resolve + lint in one step so --with-db reads the tier-4 DB-plane
+  // schema_pack (#4653) on the SAME connection the DB-backed rules use.
+  const lint = async (engine?: import('../core/engine.ts').BrainEngine) => {
+    let pack: SchemaPackManifest | null;
+    if (name) {
+      const p = packPathByName(name);
+      let raw: SchemaPackManifest | null;
+      try { raw = p ? loadPackFromFile(p) : null; } catch { raw = null; }
+      if (raw) {
+        // #4501: lint the MERGED manifest (extends chain + borrow_from
+        // resolved), matching the no-name branch's loadActivePack path —
+        // a child pack referencing inherited parent types must not fail
+        // raw-manifest lint. Fall back to the raw child (with a stderr
+        // warning) when the chain can't be resolved, e.g. missing parent.
+        try {
+          pack = (await loadResolvedPackByName(name)).manifest;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error(`warn: could not resolve extends chain for pack \`${name}\` (${msg}); linting raw manifest only`);
+          pack = raw;
+        }
+      } else {
+        pack = null;
+      }
+    } else {
+      const dbConfig = engine ? await readDbSchemaPack(engine) : await readDbSchemaPackConfig(cfg);
+      pack = (await loadActivePack({ cfg, remote: false, dbConfig })).manifest;
+    }
+    if (!pack) {
+      console.error(`Pack not found: ${name}`);
+      process.exit(1);
+    }
+    return { pack, report: await runAllLintRules(pack, engine ? { engine } : undefined) };
+  };
+  const { pack, report } = withDb ? await withConnectedEngine(lint) : await lint();
   if (json) {
     console.log(JSON.stringify({ schema_version: 1, pack: pack.name, ...report }, null, 2));
     if (!report.ok) process.exit(1);
@@ -751,7 +826,7 @@ async function runExplainCmd(args: string[]): Promise<void> {
     process.exit(2);
   }
   const cfg = loadConfig();
-  const pack = await loadActivePack({ cfg, remote: false });
+  const pack = await loadActivePack({ cfg, remote: false, dbConfig: await readDbSchemaPackConfig(cfg) });
   const found = pack.manifest.page_types.find((t) => t.name === typeName);
   if (!found) {
     console.error(`Type \`${typeName}\` not in active pack \`${pack.manifest.name}\`.`);
@@ -783,9 +858,13 @@ async function runReviewOrphansCmd(args: string[]): Promise<void> {
     console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
     return;
   }
-  console.log(`Orphan pages (no active-pack type match): ${result.orphan_count}`);
+  console.log(`Orphan pages (no active-pack type match): ${result.orphan_count}`
+    + (result.pack ? ` (pack ${result.pack})` : ' (no active pack resolved: only untyped pages checked)'));
+  for (const u of result.undeclared_types) {
+    console.log(`  type '${sanitizeTypeForDisplay(u.type)}' is not declared in the pack: ${u.count} page(s)`);
+  }
   for (const o of result.orphans.slice(0, 20)) {
-    console.log(`  ${o.slug}`);
+    console.log(`  ${o.slug}${o.reason === 'undeclared' ? ` (type ${sanitizeTypeForDisplay(o.type)})` : ' (untyped)'}`);
   }
   if (result.orphan_count > 20) {
     console.log(`  ... and ${result.orphan_count - 20} more (use --json to see all)`);
@@ -943,8 +1022,11 @@ async function runStatsCmd(args: string[]): Promise<void> {
     }
     console.log(`Pack: ${result.pack_identity ?? '(no pack loaded)'}`);
     console.log(`Total pages: ${result.aggregate.total_pages}`);
-    console.log(`Typed: ${result.aggregate.typed_pages} (${(result.aggregate.coverage * 100).toFixed(1)}%)`);
+    console.log(`Typed: ${result.aggregate.typed_pages}; matching the active pack: ${(result.aggregate.coverage * 100).toFixed(1)}%`);
     console.log(`Untyped: ${result.aggregate.untyped_pages}`);
+    if (result.aggregate.undeclared_pages > 0) {
+      console.log(`Undeclared type: ${result.aggregate.undeclared_pages} (not a page type or alias of the active pack; list them with \`gbrain schema review-orphans\`)`);
+    }
     if (result.aggregate.by_type.length > 0) {
       console.log(`\nBy type:`);
       for (const t of result.aggregate.by_type) {
@@ -963,6 +1045,28 @@ async function runStatsCmd(args: string[]): Promise<void> {
         console.log(`  ${dp.type.padEnd(20)} ${dp.prefix}`);
       }
     }
+  });
+}
+
+async function runCardinalityPreviewCmd(args: string[]): Promise<void> {
+  const { json, source } = parseFlags(args);
+  await withConnectedEngine(async (engine) => {
+    const { previewSingleValue } = await import('../core/link-single-value.ts');
+    const result = await previewSingleValue(engine, source);
+    if (json) { console.log(JSON.stringify(result, null, 2)); return; }
+    if (Object.keys(result.declared).length === 0) {
+      console.log('No single-value relations declared. A pack declares one with `cardinality: one_per_from` on a state relation (docs/guides/temporal-edges.md#declared-single-value-relations).');
+      return;
+    }
+    for (const [src, types] of Object.entries(result.declared)) console.log(`Source ${src}: single-value ${types.join(', ')}`);
+    if (result.groups.length === 0) { console.log('No page holds more than one live relationship of a declared type.'); return; }
+    for (const g of result.groups) {
+      console.log(`\n${g.subject} ${g.link_type} (${g.source_id}): ${g.live.map(l => `${l.target}${l.since ? ` since ${l.since}` : ' (undated)'}`).join(', ')}`);
+      for (const c of g.would_close) console.log(`  closes ${c.target} on ${c.close_date} (superseded by ${c.superseded_by})`);
+      for (const u of g.undated) console.log(`  leaves ${u} open: no dated start; add one to the page timeline`);
+      for (const [a, b] of g.same_date) console.log(`  leaves ${a} and ${b} open: both start on the same date`);
+    }
+    console.log('\nThe dream cycle (edge_contradictions phase) applies the closures as timeline lines; `gbrain edge-proposals list` shows them, and deleting a line reopens the relationship.');
   });
 }
 

@@ -17,6 +17,7 @@
 import type { BrainEngine } from './engine.ts';
 
 export const PGVECTOR_HNSW_VECTOR_MAX_DIMS = 2000;
+export const PGVECTOR_HNSW_HALFVEC_MAX_DIMS = 4000;
 
 const CHUNK_EMBEDDING_HNSW_INDEX =
   'CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (embedding vector_cosine_ops);';
@@ -29,8 +30,58 @@ export function chunkEmbeddingIndexSql(dims: number): string {
   ].join('\n');
 }
 
+export function hnswMaxDimsForType(columnType: 'vector' | 'halfvec'): number {
+  return columnType === 'halfvec' ? PGVECTOR_HNSW_HALFVEC_MAX_DIMS : PGVECTOR_HNSW_VECTOR_MAX_DIMS;
+}
+
+export async function readExistingEmbeddingShape(
+  engine: BrainEngine, table: 'facts' | 'query_cache',
+): Promise<{ type: 'vector' | 'halfvec'; dimensions: number } | null> {
+  const [column] = await engine.executeRaw<{ type: string | null; dimensions: number | null }>(
+    `SELECT t.typname AS type,a.atttypmod AS dimensions
+       FROM pg_class c
+       LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attname='embedding'
+         AND a.attnum>0 AND NOT a.attisdropped
+       LEFT JOIN pg_type t ON t.oid=a.atttypid
+      WHERE c.oid=to_regclass($1)`, [table]);
+  if (!column) return null;
+  if ((column.type !== 'vector' && column.type !== 'halfvec')
+    || typeof column.dimensions !== 'number' || !Number.isSafeInteger(column.dimensions) || column.dimensions <= 0) {
+    throw new Error(`Cannot replay ${table} migration: existing embedding column must be vector(n) or halfvec(n) with a positive dimension`);
+  }
+  return { type: column.type, dimensions: column.dimensions };
+}
+
+/** Whether pgvector can build an HNSW index for this exact column shape. */
+export function hnswIndexExpected(columnType: 'vector' | 'halfvec', dims: number): boolean {
+  return dims <= hnswMaxDimsForType(columnType);
+}
+
 export function applyChunkEmbeddingIndexPolicy(sql: string, dims: number): string {
   return sql.replaceAll(CHUNK_EMBEDDING_HNSW_INDEX, chunkEmbeddingIndexSql(dims));
+}
+
+/** pgvector defaults hnsw.ef_search to 40; the GUC's hard ceiling is 1000. */
+export const HNSW_EF_SEARCH_DEFAULT = 40;
+export const HNSW_EF_SEARCH_MAX = 1000;
+
+/**
+ * `hnsw.ef_search` value for a vector search that wants `candidateLimit`
+ * candidates back.
+ *
+ * This sizes the initial candidate list. Supported iterative scans can
+ * continue beyond it, so the GUC ceiling is not a SQL output/offset limit.
+ * Both engines use the same initial-list policy independently of their
+ * bounded iterative work and per-page pooling.
+ */
+export function hnswEfSearchFor(candidateLimit: number): number {
+  const wanted = Math.ceil(candidateLimit);
+  return Math.min(Math.max(wanted, HNSW_EF_SEARCH_DEFAULT), HNSW_EF_SEARCH_MAX);
+}
+
+export function supportsHnswIterativeScan(extensionVersion: string | undefined): boolean {
+  const match = extensionVersion?.match(/^(\d+)\.(\d+)(?:\.|$)/);
+  return !!match && (Number(match[1]) > 0 || Number(match[2]) >= 8);
 }
 
 // ---------------------------------------------------------------------------

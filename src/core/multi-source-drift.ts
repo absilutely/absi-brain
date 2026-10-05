@@ -28,13 +28,25 @@
  *    skipped, walk too large" status instead of letting doctor hang.
  *  - Wrapper try/catch around the walk per OV13: ENOENT/EACCES on local_path
  *    yields zero files, NOT a thrown crash that takes down the whole doctor
- *    run.
+ *    run; the source is reported in `unreadable_sources` (#5432) so doctor
+ *    says "not verified" instead of "no drift".
+ *  - #4712: the slug derivation below is `local_path`-relative only, which
+ *    is the `'source-root'` slug-root shape (#4342, src/core/sync-anchor.ts).
+ *    A source pinned to `'git-root'` mode produces slugs prefixed with its
+ *    subdir under the repo root instead — this module has no git-root
+ *    discovery of its own, so it CANNOT compute the slug sync actually
+ *    produces for such a source. Rather than compare against the wrong
+ *    slug (false-positive drift, with delete advice naming an unrelated
+ *    page), a git-root-pinned source is skipped entirely and reported via
+ *    `git_root_skipped`. True prefix-aware matching is tracked as a
+ *    follow-up, not attempted here.
  */
 
 import { readdirSync, lstatSync, statSync } from 'fs';
 import { join, relative } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { pathToSlug } from './sync.ts';
+import { readSlugRootMode } from './sync-anchor.ts';
 
 export interface SourceWithPath {
   id: string;
@@ -53,10 +65,31 @@ export interface MisroutedResult {
   /** Per-source breakdown: slugs that appear at (default, slug) but NOT at (X, slug). */
   count: number;
   sample: MisroutedSample[];
+  /**
+   * #4712: source IDs skipped because their persisted slug_root_mode is
+   * 'git-root' — this check only knows how to derive 'source-root'-shaped
+   * (local_path-relative) slugs, so a git-root-pinned source is excluded
+   * rather than checked against the wrong slug shape.
+   */
+  git_root_skipped: string[];
+  /**
+   * #5432: sources whose walk could not read their root (`root_unreadable`)
+   * or some directory below it (`subdirs_unreadable`). Their result is not
+   * verified: an unreadable root is not an empty source.
+   */
+  unreadable_sources: Array<{ source_id: string; reason: 'root_unreadable' | 'subdirs_unreadable'; dirs: number }>;
+  /** Walk bounds actually used (opts, else GBRAIN_DRIFT_LIMIT / GBRAIN_DRIFT_TIMEOUT_MS, else defaults). */
+  limit: number;
+  timeout_ms: number;
 }
 
 const DEFAULT_FILE_LIMIT = 10_000;
 const DEFAULT_TIMEOUT_MS = 5_000;
+
+function positiveIntEnv(name: string): number | undefined {
+  const n = Number(process.env[name]);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
 const SAMPLE_LIMIT = 5;
 
 /**
@@ -65,16 +98,18 @@ const SAMPLE_LIMIT = 5;
  * read errors on individual entries. Returns relative paths from `root`.
  *
  * Bounded by `limit` (max files) and `deadlineMs` (epoch ms). Returns early
- * with `truncated=true` if either bound is hit. The root-not-readable case
- * surfaces as `truncated=false, files=[]` (caller treats as "no candidates").
+ * with `truncated=true` if either bound is hit. An unreadable root sets
+ * `rootUnreadable`; each unreadable directory below it counts in
+ * `unreadableDirs`, so callers can tell "nothing to check" from "could not read".
  */
 function walkMarkdownAndMdxFiles(
   root: string,
   limit: number,
   deadlineMs: number,
-): { files: { relPath: string }[]; truncated: boolean } {
+): { files: { relPath: string }[]; truncated: boolean; rootUnreadable: boolean; unreadableDirs: number } {
   const files: { relPath: string }[] = [];
   let truncated = false;
+  let unreadableDirs = 0;
   function walk(d: string): void {
     if (truncated) return;
     let entries: string[];
@@ -82,11 +117,17 @@ function walkMarkdownAndMdxFiles(
       entries = readdirSync(d);
     } catch {
       // Unreadable directory; skip without crashing the whole walk.
+      unreadableDirs++;
       return;
     }
     for (const entry of entries) {
       if (truncated) return;
       if (entry.startsWith('.')) continue;
+      // Skip heavy non-content dirs so the walk doesn't exhaust the time
+      // budget on dependency/build trees (node_modules can be 50k+ files
+      // with zero .md). These are never gbrain page sources.
+      if (entry === 'node_modules' || entry === 'dist' || entry === 'build' ||
+          entry === '.next' || entry === 'vendor' || entry === 'target') continue;
       const full = join(d, entry);
       let isDir = false;
       try {
@@ -95,6 +136,9 @@ function walkMarkdownAndMdxFiles(
         continue;
       }
       if (isDir) {
+        // Time check on directory descent too, so a deep dependency-free
+        // tree still respects the deadline even before any .md is found.
+        if (Date.now() >= deadlineMs) { truncated = true; return; }
         walk(full);
         continue;
       }
@@ -119,12 +163,12 @@ function walkMarkdownAndMdxFiles(
   // the root would throw and crash the whole doctor run).
   try {
     statSync(root); // probe readable; throws ENOENT/EACCES if not
-    walk(root);
+    readdirSync(root);
   } catch {
-    // local_path is unreadable; return zero files, NOT truncated. Caller
-    // surfaces this as "ok with note" rather than an error.
+    return { files, truncated: false, rootUnreadable: true, unreadableDirs: 0 };
   }
-  return { files, truncated };
+  walk(root);
+  return { files, truncated, rootUnreadable: false, unreadableDirs };
 }
 
 /**
@@ -177,13 +221,15 @@ export async function findMisroutedPages(
   sources: SourceWithPath[],
   opts: { limit?: number; timeoutMs?: number } = {},
 ): Promise<MisroutedResult> {
-  const limit = opts.limit ?? DEFAULT_FILE_LIMIT;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const limit = opts.limit ?? positiveIntEnv('GBRAIN_DRIFT_LIMIT') ?? DEFAULT_FILE_LIMIT;
+  const timeoutMs = opts.timeoutMs ?? positiveIntEnv('GBRAIN_DRIFT_TIMEOUT_MS') ?? DEFAULT_TIMEOUT_MS;
   const deadlineMs = Date.now() + timeoutMs;
 
   let totalCount = 0;
   let walkTruncated = false;
   const sample: MisroutedSample[] = [];
+  const gitRootSkipped: string[] = [];
+  const unreadable: MisroutedResult['unreadable_sources'] = [];
 
   for (const src of sources) {
     if (src.id === 'default') continue;
@@ -192,8 +238,19 @@ export async function findMisroutedPages(
       walkTruncated = true;
       break;
     }
-    const { files, truncated } = walkMarkdownAndMdxFiles(src.local_path, limit, deadlineMs);
+    // #4712: local_path-relative slugs are only correct for 'source-root'-
+    // pinned sources. A 'git-root' pin means sync produces subdir-prefixed
+    // slugs this module doesn't know how to reconstruct — skip rather than
+    // compare against a slug shape that will never match.
+    const rootMode = await readSlugRootMode(engine, src.id);
+    if (rootMode === 'git-root') {
+      gitRootSkipped.push(src.id);
+      continue;
+    }
+    const { files, truncated, rootUnreadable, unreadableDirs } = walkMarkdownAndMdxFiles(src.local_path, limit, deadlineMs);
     if (truncated) walkTruncated = true;
+    if (rootUnreadable) unreadable.push({ source_id: src.id, reason: 'root_unreadable', dirs: 1 });
+    else if (unreadableDirs > 0) unreadable.push({ source_id: src.id, reason: 'subdirs_unreadable', dirs: unreadableDirs });
     if (files.length === 0) continue;
 
     // Convert FS paths to canonical slugs (lowercased, extension stripped).
@@ -215,5 +272,8 @@ export async function findMisroutedPages(
     }
   }
 
-  return { walk_truncated: walkTruncated, count: totalCount, sample };
+  return {
+    walk_truncated: walkTruncated, count: totalCount, sample, git_root_skipped: gitRootSkipped,
+    unreadable_sources: unreadable, limit, timeout_ms: timeoutMs,
+  };
 }

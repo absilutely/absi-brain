@@ -13,11 +13,11 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
 
-const AUTOPILOT_SRC = resolve('src/commands/autopilot.ts');
-const SOURCE = readFileSync(AUTOPILOT_SRC, 'utf-8');
+// W4 autopilot: containment reads the autopilot surface; positional spans name the module that holds the probe steps.
+const SOURCE = surfaceSource('autopilot');
+const PROBES_SOURCE = surfaceFileSource('autopilot', 'src/commands/autopilot-probes.ts');
 
 describe('autopilot wiring: nightly quality probe', () => {
   test('imports runNightlyQualityProbe from the phase module', () => {
@@ -31,10 +31,15 @@ describe('autopilot wiring: nightly quality probe', () => {
     expect(SOURCE).toContain(`runCrossModalBatchForProbe`);
   });
 
-  test('feature flag gate present: cfg.autopilot.nightly_quality_probe.enabled', () => {
+  test('feature flag gate present: dual-plane read (DB row wins, file plane fallback)', () => {
     // Per D10: the scheduler ONLY checks the feature flag. The 24h rate-limit
     // lives inside runNightlyQualityProbe itself (no scheduler-side precheck).
-    expect(SOURCE).toContain(`nightly_quality_probe?.enabled === true`);
+    // The flag resolves through resolveProbeEnabled so `gbrain config set
+    // autopilot.nightly_quality_probe.enabled true` (the doctor hint, DB
+    // plane) and ~/.gbrain/config.json (file plane) BOTH work — a file-only
+    // read made the printed hint a silent no-op.
+    expect(SOURCE).toContain(`getConfig('autopilot.nightly_quality_probe.enabled')`);
+    expect(SOURCE).toMatch(/resolveProbeEnabled\(dbEnabled,\s*cfg\?\.autopilot\?\.nightly_quality_probe\?\.enabled\)/);
   });
 
   test('NO scheduler-side rate-limit check (D10 simplification)', () => {
@@ -49,8 +54,13 @@ describe('autopilot wiring: nightly quality probe', () => {
     // The try/catch around the probe must log the error but never crash the loop.
     // We verify the structural pattern: the probe call is inside a try block,
     // the catch block calls logError, and consecutiveErrors is not bumped inside the catch.
-    expect(SOURCE).toMatch(/try\s*\{\s*[^}]*nightly_quality_probe/);
-    expect(SOURCE).toMatch(/catch[\s\S]*?autopilot\.nightly_probe[\s\S]*?do NOT bump consecutiveErrors/);
+    expect(PROBES_SOURCE).toMatch(/try\s*\{\s*[^}]*nightly_quality_probe/);
+    // Anchored to the nightly probe's own catch block: logError, then only
+    // comments (one of them the do-NOT-bump note), then the closing brace. A
+    // lazy [\s\S]*? span would reach the parser probe's identical comment.
+    expect(PROBES_SOURCE).toMatch(
+      /\}\s*catch\s*\(e\)\s*\{\s*logError\('autopilot\.nightly_probe', e\);\s*\/\/[^\n]*do NOT bump consecutiveErrors[^\n]*\n(\s*\/\/[^\n]*\n)*\s*\}/,
+    );
   });
 
   test('DI shape: isEnabled / hasEmbeddingProvider / resolveMaxUsd / resolveRepoRoot / runLongMemEval / runCrossModalBatch / now', () => {
@@ -64,12 +74,23 @@ describe('autopilot wiring: nightly quality probe', () => {
     expect(SOURCE).toContain(`now:`);
   });
 
+  test('resolveRepoRoot prefers the gbrain package root (committed fixture home), not the brain repoPath', () => {
+    // The DI harness in nightly-quality-probe.test.ts passes process.cwd()
+    // (= the gbrain repo in CI), which papered over the wiring passing
+    // repoPath (= sync.repo_path, the user's BRAIN repo, where the fixture
+    // never exists). Pin the package-root resolution + existence check.
+    expect(SOURCE).toMatch(/fileURLToPath\(new URL\('\.\.\/\.\.', import\.meta\.url\)\)/);
+    expect(SOURCE).toContain(`'longmemeval-nightly.jsonl'`);
+    expect(SOURCE).toMatch(/fixtureAtPkgRoot \? pkgRoot : repoPath/);
+  });
+
   test('hasEmbeddingProvider reads from gateway.isAvailable("embedding") (codex round-2 #12 — in-process, not subprocess)', () => {
     expect(SOURCE).toContain(`isAvailable('embedding')`);
     expect(SOURCE).toContain(`gateway`);
   });
 
-  test('max_usd default = 5 when config unset (matches plan default per D10)', () => {
-    expect(SOURCE).toMatch(/max_usd\s*\?\?\s*5/);
+  test('max_usd resolves dual-plane (default = 5 pinned by resolveProbeMaxUsd unit tests)', () => {
+    expect(SOURCE).toContain(`getConfig('autopilot.nightly_quality_probe.max_usd')`);
+    expect(SOURCE).toMatch(/resolveProbeMaxUsd\(dbMaxUsd,\s*cfg\?\.autopilot\?\.nightly_quality_probe\?\.max_usd\)/);
   });
 });
